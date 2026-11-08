@@ -5,3 +5,5 @@ analyzer:
     - build/**
     - android/**
     - windows/**
+    - Temp/**
+    - macos/**

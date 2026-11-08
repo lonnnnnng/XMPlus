@@ -1,17 +1,18 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-/// Local-only, unredacted HTTP diagnostics. Never upload these files.
+/// long: 诊断只保存传输摘要，登录凭据和服务端正文不能进入日志或剪贴板。
 class RequestDiagnostics {
   RequestDiagnostics._();
   static final instance = RequestDiagnostics._();
   final _changes = StreamController<void>.broadcast();
   final _entries = <RequestFailure>[];
   final _unsaved = <RequestFailure, String>{};
+  final _retiredPaths = <String>{};
+  static const maxEntries = 100;
   Future<void> _work = Future<void>.value();
   String? directory;
   String? persistenceError;
@@ -50,12 +51,18 @@ class RequestDiagnostics {
     final failure = RequestFailure(
       timestamp: diagnostic.timestamp,
       method: diagnostic.method,
-      url: diagnostic.url,
-      account: diagnostic.account,
+      url: diagnostic.safeUrl,
+      account: diagnostic.account == 'anonymous' ? '未登录请求' : '应用请求',
       path: '${diagnostic.timestamp.microsecondsSinceEpoch}-${_sequence++}.log',
     );
     _entries.add(failure);
     _unsaved[failure] = text;
+    // long: 重试风暴和磁盘写入失败都只保留最近的记录，避免内存和磁盘持续增长。
+    while (_entries.length > maxEntries) {
+      final retired = _entries.removeAt(0);
+      _unsaved.remove(retired);
+      if (p.isAbsolute(retired.path)) _retiredPaths.add(retired.path);
+    }
     _notify();
     _work = _work.then((_) async {
       try {
@@ -65,6 +72,16 @@ class RequestDiagnostics {
             FileSystemEntityType.directory) {
           throw const FileSystemException('诊断目录不可用或为链接');
         }
+        for (final path in _retiredPaths.toList()) {
+          if (p.dirname(path) == root &&
+              await FileSystemEntity.type(path, followLinks: false) ==
+                  FileSystemEntityType.file) {
+            await File(path).delete();
+          }
+          _retiredPaths.remove(path);
+        }
+        final summary = _unsaved[failure];
+        if (summary == null) return;
         failure.path = p.join(root, p.basename(failure.path));
         final file = File(failure.path);
         if (await FileSystemEntity.type(file.path, followLinks: false) !=
@@ -72,7 +89,7 @@ class RequestDiagnostics {
           throw const FileSystemException('诊断文件已存在，未覆盖');
         }
         await file.writeAsString(
-          '${jsonEncode({'timestamp': failure.timestamp.toIso8601String(), 'method': failure.method, 'url': failure.url, 'account': failure.account})}\n\n$text',
+          '${jsonEncode({'timestamp': failure.timestamp.toIso8601String(), 'method': failure.method, 'url': failure.url, 'account': failure.account})}\n\n$summary',
           flush: true,
         );
         _unsaved.remove(failure);
@@ -128,7 +145,7 @@ class RequestDiagnostic {
   int? status;
   String? transportError;
   Map<String, dynamic> responseHeaders = {};
-  List<int> Function()? responseBytes;
+  int Function()? responseByteCount;
   String completeness = '未接收到响应体';
   bool _failed = false;
 
@@ -138,27 +155,54 @@ class RequestDiagnostic {
     return RequestDiagnostics.instance.record(this, error);
   }
 
+  // long: 音频地址可能把签名放在路径里，因此日志只保留来源站点，不保留路径及参数。
+  String get safeUrl {
+    final uri = Uri.tryParse(url);
+    if (uri == null ||
+        !{'http', 'https'}.contains(uri.scheme) ||
+        uri.host.isEmpty) {
+      return '(地址已隐藏)';
+    }
+    return Uri(
+      scheme: uri.scheme,
+      host: uri.host,
+      port: uri.hasPort ? uri.port : null,
+    ).toString();
+  }
+
+  static Map<String, String> _safeHeaders(Map<String, dynamic> headers) => {
+    for (final entry in headers.entries)
+      if (const {
+        'content-type',
+        'content-length',
+        'retry-after',
+        'accept-ranges',
+      }.contains(entry.key.toLowerCase()))
+        entry.key.toLowerCase(): entry.value
+            .toString()
+            .replaceAll(RegExp(r'[\r\n]'), ' ')
+            .substring(
+              0,
+              entry.value
+                  .toString()
+                  .replaceAll(RegExp(r'[\r\n]'), ' ')
+                  .length
+                  .clamp(0, 128),
+            ),
+  };
+
   String describe(Object error) {
-    List<int> bytes;
+    var count = 0;
     try {
-      bytes = responseBytes?.call() ?? Uint8List(0);
-    } catch (captureError) {
-      bytes = Uint8List(0);
-      completeness = '$completeness；无法读取已接收的本地缓存：$captureError';
+      count = responseByteCount?.call() ?? 0;
+    } catch (_) {
+      // long: 统计失败不再回读媒体缓存；错误日志不能拖慢播放和下载。
     }
-    String body;
-    try {
-      body = utf8.decode(bytes, allowMalformed: false);
-    } on FormatException {
-      body = '(非 UTF-8；以下 base64 保留全部已捕获字节)\n${base64Encode(bytes)}';
-    }
-    return '时间 (UTC): ${timestamp.toIso8601String()}\n账号: $account\n'
-        '请求: $method $url\n请求头:\n${const JsonEncoder.withIndent('  ').convert(requestHeaders)}\n'
-        '请求头完整性: $requestHeaderAvailability\n'
-        '请求体:\n$requestBody\n\n'
+    return '时间 (UTC): ${timestamp.toIso8601String()}\n'
+        '请求: $method $safeUrl\n'
         '响应: ${status == null ? '无响应 (no response)' : 'HTTP $status'}\n'
-        '响应头:\n${const JsonEncoder.withIndent('  ').convert(responseHeaders)}\n'
-        '响应完整性: $completeness\n已捕获响应字节: ${bytes.length}\n响应体:\n$body\n\n'
-        '传输异常: ${transportError ?? '(无独立传输异常)'}\n异常 / 失败原因: $error\n';
+        '响应元数据:\n${const JsonEncoder.withIndent('  ').convert(_safeHeaders(responseHeaders))}\n'
+        '已接收响应字节: $count\n异常类型: ${error.runtimeType}\n'
+        '为保护登录信息，账号、请求头、请求体、响应正文、地址路径与参数及原始异常均不保存。\n';
   }
 }

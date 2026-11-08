@@ -66,7 +66,7 @@ class UpdateRelease {
         continue;
       final path = uri.pathSegments;
       if (path.length == 6 &&
-          path[0] == 'teikengstudio' &&
+          path[0] == 'lonnnnnng' &&
           path[1].toLowerCase() == 'xmplus' &&
           path[2] == 'releases' &&
           path[3] == 'download' &&
@@ -79,7 +79,7 @@ class UpdateRelease {
   }
 
   Uri get page =>
-      Uri.https('github.com', '/teikengstudio/XMPlus/releases/tag/$tag');
+      Uri.https('github.com', '/lonnnnnng/XMPlus/releases/tag/$tag');
 
   bool isNewerThan(String currentVersion) {
     final current = parseVersion(currentVersion);
@@ -105,6 +105,19 @@ class UpdateRelease {
             'android-$abi.apk',
       ],
       'windows-x64' => ['windows-x64.zip'],
+      // long: 优先提供与处理器匹配的 Mac 安装包，通用包作为兼容回退。
+      'macos-arm64' => [
+        'macos-arm64.dmg',
+        'macos-arm64.zip',
+        'macos-universal.dmg',
+        'macos-universal.zip',
+      ],
+      'macos-x64' => [
+        'macos-x64.dmg',
+        'macos-x64.zip',
+        'macos-universal.dmg',
+        'macos-universal.zip',
+      ],
       _ => <String>[],
     };
     for (final suffix in suffixes) {
@@ -192,15 +205,14 @@ class UpdateService extends ChangeNotifier {
   }
 
   Future<(int?, List<int>, RequestDiagnostic)> _latest() async {
-    const url =
-        'https://api.github.com/repos/teikengstudio/XMPlus/releases/latest';
+    const url = 'https://api.github.com/repos/lonnnnnng/XMPlus/releases/latest';
     for (var attempt = 0; ; attempt++) {
       if (_disposed) throw StateError('Update service is closed');
       final bytes = <int>[];
       final diagnostic =
           RequestDiagnostic(account: '公共更新检查（无账号）', method: 'GET', url: url)
             ..requestHeaders = Map<String, dynamic>.from(_http.options.headers)
-            ..responseBytes = (() => bytes);
+            ..responseByteCount = (() => bytes.length);
       Response<ResponseBody>? response;
       try {
         response = await _http.get<ResponseBody>(
@@ -221,6 +233,10 @@ class UpdateService extends ChangeNotifier {
               (_) => throw StateError('Update service closed'),
             ),
           ])) {
+            // long: 更新接口只需要元数据；异常的大响应不能无限占用内存。
+            if (bytes.length + iterator.current.length > 2 * 1024 * 1024) {
+              throw const FormatException('GitHub 发布数据超过大小限制');
+            }
             bytes.addAll(iterator.current);
           }
         } finally {
@@ -367,6 +383,12 @@ class UpdateService extends ChangeNotifier {
             }
           } else if (Platform.isWindows && Abi.current() == Abi.windowsX64) {
             target = release.downloadUri(platform: 'windows-x64');
+          } else if (Platform.isMacOS) {
+            target = release.downloadUri(
+              platform: Abi.current() == Abi.macosArm64
+                  ? 'macos-arm64'
+                  : 'macos-x64',
+            );
           }
         }
         if (_disposed) return;

@@ -439,14 +439,14 @@ class _AboutSettings extends StatelessWidget {
                   contentPadding: EdgeInsets.zero,
                   title: const Text('官方发布页'),
                   subtitle: const SelectableText(
-                    'https://github.com/teikengstudio/XMPlus/releases/latest',
+                    'https://github.com/lonnnnnng/XMPlus/releases/latest',
                   ),
                   trailing: IconButton(
                     tooltip: '打开官方发布页',
                     icon: const Icon(Icons.open_in_new),
                     onPressed: () => _openContact(
                       context,
-                      'https://github.com/teikengstudio/XMPlus/releases/latest',
+                      'https://github.com/lonnnnnng/XMPlus/releases/latest',
                     ),
                   ),
                 ),
@@ -477,14 +477,14 @@ class _AboutSettings extends StatelessWidget {
                   leading: const Icon(Icons.code),
                   title: const Text('GitHub'),
                   subtitle: const SelectableText(
-                    'https://github.com/teikengstudio/xmplus',
+                    'https://github.com/lonnnnnng/XMPlus',
                   ),
                   trailing: IconButton(
                     tooltip: '打开 GitHub',
                     icon: const Icon(Icons.open_in_new),
                     onPressed: () => _openContact(
                       context,
-                      'https://github.com/teikengstudio/xmplus',
+                      'https://github.com/lonnnnnng/XMPlus',
                     ),
                   ),
                 ),

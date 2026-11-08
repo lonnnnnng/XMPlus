@@ -305,7 +305,9 @@ class _RequestFailureDialogState extends State<_RequestFailureDialog> {
       stream: diagnostics.changes,
       builder: (context, _) {
         final entries = diagnostics.entries;
-        final selected = _selected ?? (entries.isEmpty ? null : entries.last);
+        final selected = entries.contains(_selected)
+            ? _selected
+            : (entries.isEmpty ? null : entries.last);
         return AlertDialog(
           title: Text('请求失败详情（${entries.length} 条）'),
           content: SizedBox(
@@ -314,7 +316,7 @@ class _RequestFailureDialogState extends State<_RequestFailureDialog> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                const Text('仅保存在本机。完整日志可能包含 Cookie、令牌、账号和签名等敏感信息；复制或分享前请自行核对。'),
+                const Text('仅在本机保留最近 100 条传输摘要，不保存登录凭据、请求或响应正文。'),
                 const SizedBox(height: 8),
                 SelectableText('日志目录：${diagnostics.directory ?? '尚未初始化'}'),
                 if (diagnostics.persistenceError != null)
@@ -347,7 +349,7 @@ class _RequestFailureDialogState extends State<_RequestFailureDialog> {
                         child: SelectableText(
                           snapshot.hasError
                               ? '无法读取日志：${snapshot.error}\n文件：${selected.path}'
-                              : snapshot.data ?? '正在读取完整内容…',
+                              : snapshot.data ?? '正在读取诊断摘要…',
                         ),
                       ),
                     ),
@@ -379,10 +381,10 @@ class _RequestFailureDialogState extends State<_RequestFailureDialog> {
                     },
               child: Text(
                 _copiedPath == selected?.path
-                    ? '已复制完整内容'
+                    ? '已复制摘要'
                     : _copiedPath?.startsWith('复制失败：') == true
                     ? _copiedPath!
-                    : '复制完整内容',
+                    : '复制诊断摘要',
               ),
             ),
             FilledButton(

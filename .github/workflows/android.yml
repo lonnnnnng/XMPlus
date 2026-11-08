@@ -20,6 +20,8 @@ concurrency:
 
 jobs:
   native-tools:
+    # long: 本 fork 仅发布 macOS，避免推送版本标签时连带发布其他平台。
+    if: github.repository == 'teikengstudio/XMPlus'
     uses: ./.github/workflows/native-media.yml
     with:
       android: true

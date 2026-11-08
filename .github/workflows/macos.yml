@@ -1,0 +1,45 @@
+name: Build macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install pinned Flutter SDK
+        # long: 官方发布清单暂不可用时，固定 Git 标签仍能获取对应的 SDK 和引擎。
+        run: |
+          git clone --depth 1 --branch 3.47.9 https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter-sdk"
+          "$RUNNER_TEMP/flutter-sdk/bin/flutter" --version
+          echo "$RUNNER_TEMP/flutter-sdk/bin" >> "$GITHUB_PATH"
+      - name: Resolve locked dependencies
+        run: flutter pub get --enforce-lockfile
+      - name: Analyze Dart
+        run: flutter analyze --no-pub
+      - name: Build and verify universal macOS packages
+        run: bash tool/build_macos.sh
+      - uses: actions/upload-artifact@v6
+        with:
+          name: XMPlus-macos
+          path: |
+            dist/XMPlus-*-macos-universal.dmg
+            dist/XMPlus-*-macos-universal.zip
+            dist/SHA256SUMS-macos
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

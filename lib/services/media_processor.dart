@@ -50,12 +50,19 @@ class MediaProcessor {
   static const _limit = 2 * 1024 * 1024;
   static const _protocols = ['-protocol_whitelist', 'file,pipe'];
 
-  static String _tool(String? directory, String name) => p.join(
-    directory ?? p.dirname(Platform.resolvedExecutable),
-    'tools',
-    'ffmpeg',
-    '$name${Platform.isWindows ? '.exe' : ''}',
-  );
+  static String _tool(String? directory, String name) {
+    final executableDirectory =
+        directory ?? p.dirname(Platform.resolvedExecutable);
+    // long: Mac 辅助程序放在签名认可的 Helpers 目录，移动 .app 后仍可直接使用。
+    if (Platform.isMacOS)
+      return p.normalize(p.join(executableDirectory, '..', 'Helpers', name));
+    return p.join(
+      executableDirectory,
+      'tools',
+      'ffmpeg',
+      '$name${Platform.isWindows ? '.exe' : ''}',
+    );
+  }
 
   Future<void> checkTools({Future<void> Function()? checkpoint}) =>
       _checkTools(checkpoint);
@@ -785,7 +792,7 @@ class MediaProcessor {
             account: '公共嵌入封面（无账号）',
             method: 'GET',
             url: '$uri',
-          )..responseBytes = (() => bytes);
+          )..responseByteCount = (() => bytes.length);
           await wait(_safeCoverUri(uri));
           response = null;
           final request = await wait(client.getUrl(uri));

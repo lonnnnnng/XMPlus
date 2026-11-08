@@ -391,52 +391,27 @@ class AudioCache {
   ) async {
     final diagnostic = _diagnostic!;
     const limit = 2 * 1024 * 1024;
-    final bytes = BytesBuilder(copy: false);
-    diagnostic.responseBytes = bytes.toBytes;
+    var received = 0;
+    diagnostic.responseByteCount = () => received;
     diagnostic.completeness = '响应体未接收完整（接收中或传输中断）';
     try {
       await for (final chunk in _responseBytes(response, _producerEpoch)) {
-        final remaining = limit - bytes.length;
-        if (chunk.length > remaining) {
-          if (remaining > 0) bytes.add(chunk.sublist(0, remaining));
+        received += chunk.length;
+        if (received > limit) {
           diagnostic.completeness = '错误响应体已截断：诊断上限 $limit 字节';
           break;
         }
-        bytes.add(chunk);
       }
       if (!diagnostic.completeness.contains('截断')) {
         diagnostic.completeness =
-            response.contentLength >= 0 &&
-                response.contentLength != bytes.length
-            ? '响应体不完整：声明 ${response.contentLength} 字节，收到 ${bytes.length} 字节'
+            response.contentLength >= 0 && response.contentLength != received
+            ? '响应体不完整：声明 ${response.contentLength} 字节，收到 $received 字节'
             : '完整（HTTP 响应体）';
       }
     } catch (transportError) {
       diagnostic.transportError = '$transportError';
     }
     if (!_paused && !_closed) await diagnostic.fail(error);
-  }
-
-  // Reuse bytes already written to the cache; do not buffer whole successful audio.
-  List<int> _diagnosticPrefix(int length) {
-    final bytes = BytesBuilder(copy: false);
-    var offset = 0;
-    while (offset < length) {
-      final index = offset ~/ blockSize;
-      final file = _blocks.containsKey(index) ? _block(index) : _part(index);
-      final handle = file.openSync();
-      try {
-        final chunk = handle.readSync(min(blockSize, length - offset));
-        if (chunk.length != min(blockSize, length - offset)) {
-          throw const FileSystemException('已接收音频缓存不完整');
-        }
-        bytes.add(chunk);
-        offset += chunk.length;
-      } finally {
-        handle.closeSync();
-      }
-    }
-    return bytes.takeBytes();
   }
 
   Future<({HttpClientResponse response, Uri finalUri})> _request(
@@ -758,20 +733,16 @@ class AudioCache {
       return;
     }
     final bytes = BytesBuilder(copy: false);
-    _diagnostic?.responseBytes = bytes.toBytes;
+    var received = 0;
+    _diagnostic?.responseByteCount = () => received;
     try {
       await for (final chunk in _responseBytes(response, epoch)) {
-        _diagnostic?.responseBytes = () =>
-            (BytesBuilder(copy: false)
-                  ..add(bytes.toBytes())
-                  ..add(chunk))
-                .takeBytes();
+        received += chunk.length;
         _checkState();
         if (_checkpoint != null) await _whileActive(epoch, _checkpoint);
         if (bytes.length + chunk.length > last - start + 1)
           throw const XmlyException('cache_range', '音频块长度不一致');
         bytes.add(chunk);
-        _diagnostic?.responseBytes = bytes.toBytes;
       }
       if (bytes.length != last - start + 1) {
         _diagnostic?.completeness =
@@ -779,7 +750,6 @@ class AudioCache {
         throw const XmlyException('cache_range', '音频块未接收完整');
       }
       final data = bytes.takeBytes();
-      _diagnostic?.responseBytes = () => data;
       if (index == 0) {
         _format = _sniff(data);
         final oldHash = _blocks[0];
@@ -884,18 +854,12 @@ class AudioCache {
       }
     }
 
+    // long: 失败诊断只统计网络接收量，不同步回读整个长音频，避免失败时阻塞界面。
+    var received = 0;
+    _diagnostic?.responseByteCount = () => received;
     try {
       await for (final chunk in _responseBytes(response, epoch)) {
-        final receivedOffset = offset;
-        final pendingPrefix = prefix.length == 0
-            ? const <int>[]
-            : prefix.toBytes();
-        _diagnostic?.responseBytes = () =>
-            (BytesBuilder(copy: false)
-                  ..add(_diagnosticPrefix(receivedOffset))
-                  ..add(pendingPrefix)
-                  ..add(chunk))
-                .takeBytes();
+        received += chunk.length;
         _checkState();
         if (_checkpoint != null) await _whileActive(epoch, _checkpoint);
         if (_length != null &&
@@ -904,10 +868,8 @@ class AudioCache {
         }
         if (!sniffed) {
           prefix.add(chunk);
-          _diagnostic?.responseBytes = prefix.toBytes;
           if (prefix.length < 12) continue;
           final initial = prefix.takeBytes();
-          _diagnostic?.responseBytes = () => initial;
           _format = _sniff(initial);
           _validated = true;
           sniffed = true;
@@ -917,12 +879,9 @@ class AudioCache {
         } else {
           await writeChunk(chunk);
         }
-        final received = offset;
-        _diagnostic?.responseBytes = () => _diagnosticPrefix(received);
       }
       if (!sniffed) {
         final initial = prefix.takeBytes();
-        _diagnostic?.responseBytes = () => initial;
         _format = _sniff(initial);
         _validated = true;
         _checkProducer(epoch);

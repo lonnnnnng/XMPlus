@@ -486,7 +486,7 @@ class AlbumCache extends ChangeNotifier {
             account: '公共专辑封面（无账号）',
             method: 'GET',
             url: '$uri',
-          )..responseBytes = bytes.toBytes;
+          )..responseByteCount = () => bytes.length;
           await wait(_safeCoverUri(uri));
           response = null;
           final request = await wait(client.getUrl(uri));

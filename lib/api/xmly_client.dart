@@ -363,7 +363,7 @@ class XmlyClient {
         ? Transformer.urlEncodeMap(data, ListFormat.multi)
         : jsonEncode(data);
     final bytes = BytesBuilder(copy: false);
-    diagnostic.responseBytes = bytes.toBytes;
+    diagnostic.responseByteCount = () => bytes.length;
     try {
       final response = await _dio.fetch<ResponseBody>(options);
       final body = response.data;
@@ -425,7 +425,7 @@ class XmlyClient {
       }
       if (body == null) throw const XmlyException('invalid_json', '接口响应为空');
       final responseBytes = bytes.takeBytes();
-      diagnostic.responseBytes = () => responseBytes;
+      diagnostic.responseByteCount = () => responseBytes.length;
       Map<String, dynamic> payload;
       try {
         final decoded = jsonDecode(
@@ -1425,7 +1425,7 @@ class XmlyClient {
               }
             }
             final bytes = BytesBuilder(copy: false);
-            diagnostic.responseBytes = bytes.toBytes;
+            diagnostic.responseByteCount = () => bytes.length;
             final successful = status == 200 || status == 206;
             final limit = successful ? 12 : 4096;
             final body = response.data;
@@ -1457,7 +1457,7 @@ class XmlyClient {
                 type.isEmpty))
               throw const XmlyException('invalid_media', '响应不是音频，未缓存错误页面');
             final prefix = bytes.takeBytes();
-            diagnostic.responseBytes = () => prefix;
+            diagnostic.responseByteCount = () => prefix.length;
             bool text(int offset, String value) {
               if (prefix.length < offset + value.length) return false;
               for (var i = 0; i < value.length; i++) {

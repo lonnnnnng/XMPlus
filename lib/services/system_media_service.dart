@@ -18,8 +18,8 @@ class SystemMediaService extends BaseAudioHandler {
     required PlayerService player,
     required AlbumCache albumCache,
   }) async {
-    if (!Platform.isAndroid && !Platform.isWindows) {
-      throw UnsupportedError('系统媒体控制仅支持 Android 和 Windows');
+    if (!Platform.isAndroid && !Platform.isWindows && !Platform.isMacOS) {
+      throw UnsupportedError('当前平台暂不支持系统媒体控制');
     }
     if (Platform.isWindows) WindowsAudioServicePlatform.registerWith();
     final handler = SystemMediaService._(player, albumCache);

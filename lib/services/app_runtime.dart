@@ -149,7 +149,7 @@ class AppRuntime extends ChangeNotifier {
       _cachedDownloadStates[task.id] = task.state;
     }
     await player.load();
-    if (Platform.isAndroid || Platform.isWindows) {
+    if (Platform.isAndroid || Platform.isWindows || Platform.isMacOS) {
       _systemMedia = await SystemMediaService.start(
         player: player,
         albumCache: albumCache,
