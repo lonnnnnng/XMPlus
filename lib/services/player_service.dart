@@ -955,7 +955,10 @@ class PlayerService {
       }
       _official.start('player', current!, _progressIdentity);
       _manualPaused = false;
+      final previousError = error;
       await _driver.play();
+      // long: 音频焦点恢复后清除上次播放失败，保留等待期间新到达的设备错误。
+      if (request == _request && identical(error, previousError)) error = null;
       _notify();
     });
   });

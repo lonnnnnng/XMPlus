@@ -87,6 +87,10 @@ class SystemMediaService extends BaseAudioHandler {
       _dismissed = false;
       _everActive = true;
     }
+    // long: 应用内重试不经过通知栏命令入口；恢复加载或播放后，旧命令错误应随之失效。
+    if (_player.error == null && (_player.loading || _player.playing)) {
+      _commandError = null;
+    }
     final error = _nativeError ?? _commandError ?? _player.error;
     final active =
         track != null &&

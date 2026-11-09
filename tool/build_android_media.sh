@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Linux / Android NDK r28c. Inputs are checked against the committed source lock.
+# long: Linux/macOS 共用锁定源码和 NDK 配方，主机差异不改变 Android 产物。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -7,16 +7,22 @@ SOURCE_ROOT="${SOURCE_ROOT:-$ROOT}"
 SOURCE_ROOT="$(cd "$SOURCE_ROOT" && pwd)"
 MANIFEST="$SOURCE_ROOT/tool/media_sources.json"
 NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${ANDROID_HOME:?Set ANDROID_HOME or ANDROID_NDK_HOME}/ndk/28.2.13676358}}"
-TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
 BUILD="$ROOT/build/android-media"
-JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN)}"
+case "$(uname -s)" in
+    Darwin) HOST_TAG=darwin-x86_64; JOBS="${JOBS:-$(sysctl -n hw.logicalcpu)}";;
+    Linux) HOST_TAG=linux-x86_64; JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN)}";;
+    *) echo 'Build requires macOS or Linux' >&2; exit 1;;
+esac
+TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/$HOST_TAG"
+# long: macOS 自带 shasum，避免为相同摘要算法安装第二套 coreutils。
+sha256_file() { shasum -a 256 "$1" | cut -d' ' -f1; }
 ABIS=(arm64-v8a armeabi-v7a x86_64)
 if (( $# > 1 )); then echo "Usage: bash tool/build_android_media.sh [arm64-v8a|armeabi-v7a|x86_64]" >&2; exit 2; fi
 if (( $# == 1 )); then
     case "$1" in arm64-v8a|armeabi-v7a|x86_64) ABIS=("$1");; *) echo "Unsupported ABI: $1" >&2; exit 2;; esac
 fi
-for command in jq make tar sha256sum; do command -v "$command" >/dev/null; done
-[[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || { echo 'Build requires Linux x86_64' >&2; exit 1; }
+for command in jq make tar shasum; do command -v "$command" >/dev/null; done
+[[ "$HOST_TAG" != linux-x86_64 || "$(uname -m)" == x86_64 ]] || { echo 'Linux build requires x86_64' >&2; exit 1; }
 [[ -x "$TOOLCHAIN/bin/clang" ]] || { echo "Missing NDK toolchain: $TOOLCHAIN" >&2; exit 1; }
 [[ "$(< "$NDK/source.properties")" == *'28.2.13676358'* ]] || { echo 'NDK 28.2.13676358 required' >&2; exit 1; }
 mkdir -p "$BUILD/sources"
@@ -27,7 +33,7 @@ for component in ffmpeg lame; do
     entry="$(jq -ce --arg name "$component" '[.components[] | select(.name == $name)] | if length == 1 then .[0] else error("Missing/duplicate source") end' "$MANIFEST")"
     archive="$SOURCE_ROOT/$(jq -r '.file' <<< "$entry")"
     digest="$(jq -r '.sha256' <<< "$entry")"
-    printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --status
+    [[ "$(sha256_file "$archive")" == "$digest" ]] || { echo "Source hash mismatch: $archive" >&2; exit 1; }
     version="$(jq -r '.version' <<< "$entry")"
     destination="$BUILD/sources/$component-$version"
     # Re-extract verified source so stale or edited unpacked trees cannot enter a build.
@@ -110,11 +116,11 @@ for abi in "${ABIS[@]}"; do
         "$STRIP" --strip-all -o "$output/libxmplus_$tool.so" "$WORK/ffmpeg/$tool"
         chmod 755 "$output/libxmplus_$tool.so"
         "$TOOLCHAIN/bin/llvm-readelf" -h -l -d "$output/libxmplus_$tool.so" > "$WORK/receipt/$tool.elf.txt"
-        sha256sum "$output/libxmplus_$tool.so" >> "$WORK/receipt/outputs.sha256"
+        shasum -a 256 "$output/libxmplus_$tool.so" >> "$WORK/receipt/outputs.sha256"
     done
     jq -n --arg abi "$abi" --arg cc "$CC" --arg sourceRoot "$SOURCE_ROOT" \
-        --arg ffmpeg "$(sha256sum "$output/libxmplus_ffmpeg.so" | cut -d' ' -f1)" \
-        --arg ffprobe "$(sha256sum "$output/libxmplus_ffprobe.so" | cut -d' ' -f1)" \
+        --arg ffmpeg "$(sha256_file "$output/libxmplus_ffmpeg.so")" \
+        --arg ffprobe "$(sha256_file "$output/libxmplus_ffprobe.so")" \
         --slurpfile sources "$MANIFEST" \
         '{schemaVersion:1, abi:$abi, api:24, ndk:"28.2.13676358", compiler:$cc,
           sourceRoot:$sourceRoot, sources:$sources[0], executableType:"Android PIE (ET_DYN, not JNI)",
