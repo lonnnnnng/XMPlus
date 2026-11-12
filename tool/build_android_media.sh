@@ -86,13 +86,14 @@ for abi in "${ABIS[@]}"; do
         cd "$WORK/ffmpeg"
         # This set mirrors MediaProcessor: audio transcode/remux/hash plus cover
         # decode and null-output validation. FFmpeg selects its core graph helpers.
+        # long: 上游通过 FFmetadata 文件写入标签，缺少解复用器会让默认下载在媒体处理阶段失败。
         args=("$FFMPEG_SOURCE/configure" "--prefix=$PREFIX" --target-os=android
               "--arch=$arch" "--cpu=$cpu" --enable-cross-compile
               "--cc=$CC" "--cxx=$CXX" "--ar=$AR" "--nm=$NM" "--ranlib=$RANLIB" "--strip=$STRIP"
               --disable-everything --disable-autodetect --disable-network
               --enable-static --disable-shared --enable-pic --enable-libmp3lame --enable-zlib
               --enable-ffmpeg --enable-ffprobe --enable-protocol=file,pipe
-              --enable-demuxer=aac,mp3,mov,flac,ogg,wav,image2,image2pipe,image_png_pipe,image_jpeg_pipe
+              --enable-demuxer=aac,mp3,mov,flac,ogg,wav,ffmetadata,image2,image2pipe,image_png_pipe,image_jpeg_pipe
               --enable-muxer=mp3,mov,mp4,ipod,flac,ogg,wav,null,hash
               --enable-decoder=aac,alac,mp3,mp3float,flac,vorbis,opus,png,mjpeg
               --enable-decoder=pcm_alaw,pcm_mulaw,pcm_s8,pcm_u8,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_s32be,pcm_s64le,pcm_s64be,pcm_u16le,pcm_u16be,pcm_u24le,pcm_u24be,pcm_u32le,pcm_u32be,pcm_f16le,pcm_f24le,pcm_f32le,pcm_f32be,pcm_f64le,pcm_f64be
