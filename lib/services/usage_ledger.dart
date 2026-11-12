@@ -103,6 +103,8 @@ class UsageLedger {
   final Lock _watchChanges = Lock();
   _Listening? _watch;
 
+  bool get needsRestart => _watch?.suspended ?? false;
+
   static Duration Function() _elapsedClock() {
     final watch = Stopwatch()..start();
     return () => watch.elapsed;
@@ -173,6 +175,16 @@ class UsageLedger {
               item.state == DebitState.submitting ||
               item.state == DebitState.uncertain,
         );
+  }
+
+  /// A durable zero-baseline report cannot be resolved by comparing balances.
+  bool hasUnverifiableReport(String identity) {
+    if (identity == 'anonymous') return false;
+    final pending = _ledger(identity)['usage_pending'];
+    return pending is Map &&
+        pending['accountIdentity'] == identity &&
+        pending['balanceBefore'] == 0 &&
+        (pending['state'] == 'submitting' || pending['state'] == 'uncertain');
   }
 
   void _guard(String identity) {
@@ -255,66 +267,70 @@ class UsageLedger {
     if (!userConfirmed) {
       throw const XmlyException('confirmation_required', '请先确认本首扣时及不可自动退款说明');
     }
-    await _settleLocked(identity);
-    final quota = await clientFor(identity).queryQuota();
-    if ((expectedSeconds != null && expectedSeconds != seconds) ||
-        (expectedBalance != null &&
-            expectedBalance != quota.remainingSeconds)) {
-      throw const XmlyException('confirmation_changed', '时长或余额已改变，请重新确认');
-    }
-    if (quota.remainingSeconds < seconds) throw _insufficient;
-    for (var attempt = 0; ; attempt++) {
-      final operation = DownloadReceipt(
-        operationId: const Uuid().v4(),
-        accountIdentity: identity,
-        trackId: audio.track.id,
-        taskId: taskId,
-        seconds: seconds,
-        balanceBefore: quota.remainingSeconds,
-        createdAt: _clock(),
-        state: DebitState.submitting,
-      ).toJson();
-      try {
-        await _submit(identity, operation, online: false);
-        return receipts(
-          identity,
-        ).singleWhere((item) => item.operationId == operation['operationId']);
-      } on XmlyException catch (error) {
-        final rejected = receipts(identity).any(
-          (receipt) =>
-              receipt.operationId == operation['operationId'] &&
-              receipt.state == DebitState.rejected,
-        );
-        if (!rejected ||
-            !error.definitive ||
-            attempt >= 4 ||
-            const {
-              'invalid_duration',
-              'invalid_ledger',
-              'login_expired',
-              'login_required',
-              'account_mismatch',
-              'invalid_endpoint',
-              'insufficient_quota',
-              'rate_limited',
-            }.contains(error.code))
-          rethrow;
-        final backoff = Duration(seconds: 1 << attempt);
-        final delay = (error.retryAfter ?? Duration.zero) > backoff
-            ? error.retryAfter!
-            : backoff;
-        if (wait != null) {
-          await wait(delay);
-        } else {
-          await Future<void>.delayed(delay);
-        }
-        _guard(identity);
-        final refreshed = await clientFor(identity).queryQuota();
-        if (refreshed.remainingSeconds != quota.remainingSeconds) {
-          throw const XmlyException('confirmation_changed', '重试前余额已变化，请重新确认');
+    await _settleLocked(identity, pause: false);
+    // Settlement takes its own balance lock. Acquire this only afterwards;
+    // keep the fresh quote, durable journal, report and result atomic to claims.
+    return clientFor(identity).withBalanceChange(() async {
+      final quota = await clientFor(identity).queryQuota();
+      if ((expectedSeconds != null && expectedSeconds != seconds) ||
+          (expectedBalance != null &&
+              expectedBalance != quota.remainingSeconds)) {
+        throw const XmlyException('confirmation_changed', '时长或余额已改变，请重新确认');
+      }
+      if (quota.remainingSeconds < seconds) throw _insufficient;
+      for (var attempt = 0; ; attempt++) {
+        final operation = DownloadReceipt(
+          operationId: const Uuid().v4(),
+          accountIdentity: identity,
+          trackId: audio.track.id,
+          taskId: taskId,
+          seconds: seconds,
+          balanceBefore: quota.remainingSeconds,
+          createdAt: _clock(),
+          state: DebitState.submitting,
+        ).toJson();
+        try {
+          await _submit(identity, operation, online: false);
+          return receipts(
+            identity,
+          ).singleWhere((item) => item.operationId == operation['operationId']);
+        } on XmlyException catch (error) {
+          final rejected = receipts(identity).any(
+            (receipt) =>
+                receipt.operationId == operation['operationId'] &&
+                receipt.state == DebitState.rejected,
+          );
+          if (!rejected ||
+              !error.definitive ||
+              attempt >= 4 ||
+              const {
+                'invalid_duration',
+                'invalid_ledger',
+                'login_expired',
+                'login_required',
+                'account_mismatch',
+                'invalid_endpoint',
+                'insufficient_quota',
+                'rate_limited',
+              }.contains(error.code))
+            rethrow;
+          final backoff = Duration(seconds: 1 << attempt);
+          final delay = (error.retryAfter ?? Duration.zero) > backoff
+              ? error.retryAfter!
+              : backoff;
+          if (wait != null) {
+            await wait(delay);
+          } else {
+            await Future<void>.delayed(delay);
+          }
+          _guard(identity);
+          final refreshed = await clientFor(identity).queryQuota();
+          if (refreshed.remainingSeconds != quota.remainingSeconds) {
+            throw const XmlyException('confirmation_changed', '重试前余额已变化，请重新确认');
+          }
         }
       }
-    }
+    });
   });
 
   static const _insufficient = XmlyException(
@@ -347,7 +363,10 @@ class UsageLedger {
       await _recover(identity);
       _guard(identity);
       final quota = await clientFor(identity).queryQuota();
-      if (quota.remainingSeconds - debt(identity) <= 0) throw _insufficient;
+      final newDevice = quota.newDevice && quota.remainingSeconds == 0;
+      if (!newDevice && quota.remainingSeconds - debt(identity) <= 0) {
+        throw _insufficient;
+      }
       _watch = _Listening(identity, normalized, speed, _monotonic());
     });
   });
@@ -359,40 +378,86 @@ class UsageLedger {
   }
 
   /// No position argument: seeking can never produce billable seconds.
-  /// Feed actual state periodically as well as on player state/rate changes.
+  /// Record device events immediately; periodic saves use [sampleCurrentState].
+  void recordPlaybackState({
+    required bool playing,
+    required bool buffering,
+    double? speed,
+  }) {
+    if (speed != null) _validSpeed(speed);
+    final watch = _watch;
+    if (watch == null || watch.suspended) return;
+    _captureElapsed(watch);
+    watch.playing = playing && !buffering;
+    if (speed != null) watch.speed = speed;
+  }
+
+  /// Save the latest device state without replacing it with queued UI state.
+  Future<void> sampleCurrentState({double? speed}) {
+    if (speed != null) {
+      _validSpeed(speed);
+      final watch = _watch;
+      if (watch != null) {
+        _captureElapsed(watch);
+        watch.speed = speed;
+      }
+    }
+    return observe(
+      playing: _watch?.playing ?? false,
+      buffering: false,
+      stateAlreadyRecorded: true,
+    );
+  }
+
   Future<void> observe({
     required bool playing,
     required bool buffering,
     double? speed,
-  }) => _watchChanges.synchronized(() async {
-    if (speed != null) _validSpeed(speed);
-    final watch = _watch;
-    if (watch == null) return;
-    await _lock(watch.identity).synchronized(() async {
-      await _sample(watch.identity);
-      if (isBlocked(watch.identity)) {
-        watch.playing = false;
-        throw _uncertain;
-      }
-      watch.playing = playing && !buffering;
-      if (speed != null) watch.speed = speed;
-      if (!playing ||
-          _monotonic() - watch.settledAt >= const Duration(seconds: 120)) {
-        // Pause settles; a periodic settlement must preserve actual playing state.
-        await _settleLocked(watch.identity, pause: !playing);
-      }
+    bool stateAlreadyRecorded = false,
+  }) {
+    if (!stateAlreadyRecorded) {
+      recordPlaybackState(playing: playing, buffering: buffering, speed: speed);
+    }
+    final observedWatch = _watch;
+    return _watchChanges.synchronized(() async {
+      final watch = observedWatch;
+      if (watch == null || !identical(watch, _watch)) return;
+      await _lock(watch.identity).synchronized(() async {
+        try {
+          await _sample(watch.identity);
+          if (isBlocked(watch.identity)) throw _uncertain;
+          if (!playing ||
+              _monotonic() - watch.settledAt >= const Duration(seconds: 120)) {
+            // A later device event may already have updated the actual state.
+            await _settleLocked(watch.identity, pause: false);
+          }
+        } catch (_) {
+          _suspend(watch);
+          rethrow;
+        }
+      });
     });
-  });
+  }
 
-  Future<void> _sample(String identity) async {
-    final watch = _watch;
-    if (watch == null || watch.identity != identity) return;
+  void _captureElapsed(_Listening watch) {
     final now = _monotonic();
     final elapsed = now > watch.sampledAt
         ? (now - watch.sampledAt).inMicroseconds / 1000000
         : 0.0;
     watch.unsaved += watch.playing ? elapsed * watch.speed * reportFactor : 0;
     watch.sampledAt = now;
+  }
+
+  void _suspend(_Listening watch) {
+    _captureElapsed(watch);
+    watch.playing = false;
+    watch.suspended = true;
+  }
+
+  Future<void> _sample(String identity) async {
+    final watch = _watch;
+    if (watch == null || watch.identity != identity) return;
+    _captureElapsed(watch);
     if (watch.unsaved == 0) return;
     final amount = watch.unsaved;
     try {
@@ -400,7 +465,7 @@ class UsageLedger {
       await _write(identity, (ledger) => ledger['usage_seconds'] = total);
       watch.unsaved -= amount;
     } catch (_) {
-      watch.playing = false;
+      _suspend(watch);
       rethrow;
     }
   }
@@ -417,17 +482,39 @@ class UsageLedger {
     });
   });
 
+  /// Previewing or prepaying a download does not pause actual playback. Keep
+  /// sampling the watch across network waits, as periodic settlement does.
+  Future<void> settleForDownload(String identity) =>
+      _lock(identity).synchronized(() => _settleLocked(identity, pause: false));
+
   /// Callers pause the player before this account-switch/exit boundary.
   Future<void> settle([String? identity]) async {
     if (identity != null) {
       await _lock(identity).synchronized(() => _settleLocked(identity));
       return;
     }
+    await _settleAccounts();
+  }
+
+  /// Exit can leave these durable journals intact, but may not replay them.
+  Future<void> settleForExit() => _settleAccounts(exiting: true);
+
+  Future<void> _settleAccounts({bool exiting = false}) async {
     final identities = (storage.state['accounts'] as Map).keys
         .cast<String>()
         .toList();
     for (final id in identities) {
-      await _lock(id).synchronized(() => _settleLocked(id));
+      await _lock(id).synchronized(() async {
+        try {
+          await _settleLocked(id);
+        } on XmlyException catch (error) {
+          if (!exiting ||
+              error.code != 'usage_uncertain' ||
+              !hasUnverifiableReport(id)) {
+            rethrow;
+          }
+        }
+      });
     }
   }
 
@@ -444,19 +531,22 @@ class UsageLedger {
     var seconds = debt(identity).floor();
     while (seconds > 0) {
       final amount = seconds > maxSeconds ? maxSeconds : seconds;
-      final quota = await clientFor(identity).queryQuota();
-      if (quota.remainingSeconds < amount) throw _insufficient;
-      final operation = <String, dynamic>{
-        'operationId': const Uuid().v4(),
-        'accountIdentity': identity,
-        'trackId': watch?.identity == identity ? watch!.trackId : '',
-        'seconds': amount,
-        'balanceBefore': quota.remainingSeconds,
-        'balanceAfter': null,
-        'createdAt': _clock().millisecondsSinceEpoch,
-        'state': 'submitting',
-      };
-      await _submit(identity, operation, online: true);
+      await clientFor(identity).withBalanceChange(() async {
+        final quota = await clientFor(identity).queryQuota();
+        final newDevice = quota.newDevice && quota.remainingSeconds == 0;
+        if (!newDevice && quota.remainingSeconds < amount) throw _insufficient;
+        final operation = <String, dynamic>{
+          'operationId': const Uuid().v4(),
+          'accountIdentity': identity,
+          'trackId': watch?.identity == identity ? watch!.trackId : '',
+          'seconds': amount,
+          'balanceBefore': quota.remainingSeconds,
+          'balanceAfter': null,
+          'createdAt': _clock().millisecondsSinceEpoch,
+          'state': 'submitting',
+        };
+        await _submit(identity, operation, online: true);
+      });
       seconds = debt(identity).floor();
     }
     if (watch?.identity == identity) watch!.settledAt = _monotonic();
@@ -499,7 +589,11 @@ class UsageLedger {
                     .debitSeconds(operation['seconds'] as int))
                 .remainingSeconds;
     } catch (error) {
-      if (error is XmlyException && error.definitive) {
+      // A generic rejection is not operation-specific proof for a report on
+      // a device without a balance bucket. Keep its journal replay-blocking.
+      if (error is XmlyException &&
+          error.definitive &&
+          !(online && balanceBefore == 0)) {
         try {
           await _finish(
             identity,
@@ -517,6 +611,7 @@ class UsageLedger {
       throw _uncertain;
     }
     operation['balanceAfter'] = balanceAfter;
+    // A new-device flag describes quota, not whether this report was applied.
     if (!freeDay && balanceBefore - balanceAfter != operation['seconds']) {
       await _markUncertain(identity, operation, online: online);
       throw _uncertain;
@@ -565,7 +660,7 @@ class UsageLedger {
     Map<String, dynamic> operation, {
     required bool online,
   }) async {
-    if (_watch?.identity == identity) _watch!.playing = false;
+    if (_watch?.identity == identity) _suspend(_watch!);
     try {
       await _write(identity, (ledger) {
         final pending = {...operation, 'state': 'uncertain'};
@@ -614,8 +709,18 @@ class UsageLedger {
         (online && (operation['seconds'] as int) > debt(identity))) {
       throw const XmlyException('invalid_ledger', '待核对扣时记录无效，请保留资料');
     }
-    // Refresh for the reconciliation screen, but never attribute its changes.
-    await queryClient(identity).queryQuota();
+    // The screen already tried to display the balance. A human decision made
+    // in the official app must remain saveable when that query is unavailable.
+    // Validate the mounted identity without making another network request.
+    queryClient(identity);
+    // A report may be accepted without deducting anything on a new device.
+    // Neither manual balance-based answer proves whether it was applied.
+    if (online && operation['balanceBefore'] == 0) {
+      throw const XmlyException(
+        'usage_uncertain',
+        '新设备没有可核对的余额变动，已保留听时记录，不会重复上报',
+      );
+    }
     await _finish(
       identity,
       operation,
@@ -640,5 +745,6 @@ class _Listening {
   double speed;
   Duration sampledAt, settledAt;
   bool playing = false;
+  bool suspended = false;
   double unsaved = 0;
 }

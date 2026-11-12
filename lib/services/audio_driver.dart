@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:audio_session/audio_session.dart';
 import 'package:media_kit/media_kit.dart';
 
+import 'close_sequence.dart';
+
 /// Device observations, not requested commands. Epoch rejects old-source events.
 class AudioSnapshot {
   const AudioSnapshot({
@@ -36,11 +38,20 @@ abstract class AudioDriver {
 
 void requireLocalAudio(Uri uri) {
   if (uri.scheme == 'file' &&
-      uri.host.isEmpty &&
-      uri.path.isNotEmpty &&
+      (uri.host.isEmpty || Platform.isWindows) &&
+      uri.userInfo.isEmpty &&
+      !uri.hasPort &&
+      uri.hasAbsolutePath &&
       !uri.hasQuery &&
-      !uri.hasFragment)
-    return;
+      !uri.hasFragment) {
+    try {
+      // Windows file hosts are UNC shares already supported by downloads.
+      uri.toFilePath(windows: Platform.isWindows);
+      return;
+    } on UnsupportedError {
+      // Malformed file URIs must not become a different native media resource.
+    }
+  }
   if (uri.scheme == 'http' &&
       uri.host == '127.0.0.1' &&
       uri.hasPort &&
@@ -61,7 +72,27 @@ class MediaKitAudioDriver implements AudioDriver {
   bool _closed = false;
   AudioSession? _session;
   Future<void> _commands = Future<void>.value();
-  Future<void>? _closing;
+  late final _closeSteps = CloseSequence([
+    () async {
+      _closed = true;
+      _cancelResume();
+      await _commands;
+    },
+    () async {
+      while (_subscriptions.isNotEmpty) {
+        await _subscriptions.last.cancel();
+        _subscriptions.removeLast();
+      }
+    },
+    _releaseFocus,
+    () async {
+      await _player?.dispose();
+      _player = null;
+    },
+    () async {
+      await _events.close();
+    },
+  ]);
   int _intent = 0;
   int? _resumeIntent;
   @override
@@ -211,6 +242,11 @@ class MediaKitAudioDriver implements AudioDriver {
   @override
   Future<void> open(Uri localUri, {required int epoch}) async {
     requireLocalAudio(localUri);
+    // media_kit's file URI sanitizer can turn a named UNC host into a local
+    // directory. Give it the native file path to preserve the share and escapes.
+    final resource = localUri.scheme == 'file'
+        ? localUri.toFilePath(windows: Platform.isWindows)
+        : localUri.toString();
     _cancelResume();
     await _run(() async {
       _opening = true;
@@ -219,7 +255,7 @@ class MediaKitAudioDriver implements AudioDriver {
         await player.stop();
         await _releaseFocus();
         _epoch = epoch;
-        await player.open(Media(localUri.toString()), play: false);
+        await player.open(Media(resource), play: false);
         await player.setPitch(1.0);
       } finally {
         _opening = false;
@@ -266,24 +302,5 @@ class MediaKitAudioDriver implements AudioDriver {
     await _player?.setVolume(volume);
   });
   @override
-  Future<void> close() => _closing ??= _dispose();
-
-  Future<void> _dispose() async {
-    _closed = true;
-    _cancelResume();
-    await _commands;
-    try {
-      for (final subscription in _subscriptions) {
-        await subscription.cancel();
-      }
-      await _releaseFocus();
-    } finally {
-      try {
-        await _player?.dispose();
-      } finally {
-        _player = null;
-        await _events.close();
-      }
-    }
-  }
+  Future<void> close() => _closeSteps.run();
 }

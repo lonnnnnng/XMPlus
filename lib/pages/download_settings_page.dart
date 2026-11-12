@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -17,9 +18,15 @@ class DownloadSettingsPage extends StatefulWidget {
 class _DownloadSettingsPageState extends State<DownloadSettingsPage>
     with WidgetsBindingObserver {
   String? _error;
-  bool _saving = false;
+  int _pendingSaves = 0;
+  bool get _saving => _pendingSaves > 0;
+  bool _disposing = false;
+  Timer? _textSaveTimer;
+  final Map<String, Object> _pendingText = {};
+  ScaffoldMessengerState? _messenger;
   bool? _batteryExempt;
   bool _requestingBattery = false;
+  bool _clearingUrlCache = false;
 
   @override
   void initState() {
@@ -31,7 +38,14 @@ class _DownloadSettingsPageState extends State<DownloadSettingsPage>
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _messenger = ScaffoldMessenger.maybeOf(context);
+  }
+
+  @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) unawaited(_flushText());
     if (state == AppLifecycleState.resumed) _readBatteryStatus();
   }
 
@@ -59,6 +73,8 @@ class _DownloadSettingsPageState extends State<DownloadSettingsPage>
 
   @override
   void dispose() {
+    _disposing = true;
+    unawaited(_flushText());
     if (Platform.isAndroid) WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -67,36 +83,118 @@ class _DownloadSettingsPageState extends State<DownloadSettingsPage>
       (widget.runtime.storage.state['settings'] as Map)['download'] as Map? ??
       const {};
 
-  Future<void> _set(String key, Object value) async {
-    if (_saving) return;
-    setState(() {
-      _saving = true;
-      _error = null;
-    });
+  void _editText(String key, Object? value) {
+    if (value == null) {
+      _pendingText.remove(key);
+    } else {
+      _pendingText[key] = value;
+    }
+    _textSaveTimer?.cancel();
+    if (_pendingText.isNotEmpty) {
+      _textSaveTimer = Timer(
+        const Duration(milliseconds: 400),
+        () => unawaited(_flushText()),
+      );
+    }
+  }
+
+  Map<String, Object> _takeText() {
+    _textSaveTimer?.cancel();
+    final values = Map<String, Object>.from(_pendingText);
+    _pendingText.clear();
+    return values;
+  }
+
+  Future<void> _flushText() => _save(_takeText());
+
+  Future<void> _set(String key, Object value) =>
+      _save({..._takeText(), key: value});
+
+  Future<void> _save(Map<String, Object> values) async {
+    if (values.isEmpty) return;
+    ++_pendingSaves;
+    if (mounted && !_disposing) setState(() => _error = null);
     try {
       await widget.runtime.storage.transaction((state) {
         final settings = state['settings'] as Map;
         final download =
             settings.putIfAbsent('download', () => <String, dynamic>{}) as Map;
-        download[key] = value;
+        download.addAll(values);
       });
       widget.runtime.changed();
     } catch (_) {
-      if (mounted)
+      if (mounted && !_disposing) {
         setState(() {
-          _error = '设置保存失败，原值已保留';
+          _error = '设置保存失败，请重新修改后重试';
         });
+      } else if (_messenger?.mounted == true) {
+        _messenger!.showSnackBar(
+          const SnackBar(content: Text('下载设置保存失败，请返回设置页重试')),
+        );
+      }
     } finally {
-      if (mounted)
-        setState(() {
-          _saving = false;
-        });
+      --_pendingSaves;
+      if (mounted && !_disposing) setState(() {});
     }
   }
 
+  static String? _filenameError(String? text) {
+    final value = text ?? '';
+    if (value.contains('/') ||
+        value.contains(r'\') ||
+        value == '.' ||
+        value == '..') {
+      return '文件名不能包含目录路径，请使用“按专辑建立文件夹”';
+    }
+    final tokens = RegExp(r'\{([^{}]+)\}')
+        .allMatches(value)
+        .map((match) => match[1]!);
+    if (value.trim().isEmpty ||
+        tokens.any(
+          (token) => !const {
+            'index',
+            'title',
+            'trackId',
+            'album',
+            'albumId',
+          }.contains(token),
+        ) ||
+        value.replaceAll(RegExp(r'\{[^{}]+\}'), '').contains(RegExp(r'[{}]'))) {
+      return '文件名格式包含无效变量，尚未保存';
+    }
+    return null;
+  }
+
   Future<void> _directory() async {
-    final directory = await FilePicker.getDirectoryPath(dialogTitle: '选择下载目录');
-    if (directory != null) await _set('rootDirectory', directory);
+    try {
+      final directory = await FilePicker.getDirectoryPath(dialogTitle: '选择下载目录');
+      if (directory != null && mounted) await _set('rootDirectory', directory);
+    } catch (_) {
+      if (mounted) setState(() => _error = '无法选择下载目录，请重试');
+    }
+  }
+
+  Future<void> _clearUrlCache() async {
+    if (_clearingUrlCache) return;
+    setState(() {
+      _clearingUrlCache = true;
+      _error = null;
+    });
+    try {
+      final runtime = widget.runtime;
+      await Future.wait([
+        runtime.anonymous.clearUrlCache(),
+        for (final id in runtime.accounts.accountIds)
+          runtime.accounts.clientFor(id).clearUrlCache(),
+      ]);
+      if (mounted)
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('已清除所有 URL 缓存')));
+    } catch (error) {
+      if (mounted) setState(() => _error = 'URL 缓存清除失败：$error');
+    } finally {
+      if (mounted) setState(() => _clearingUrlCache = false);
+    }
   }
 
   Widget _number(
@@ -106,9 +204,8 @@ class _DownloadSettingsPageState extends State<DownloadSettingsPage>
     int minimum,
     int maximum,
   ) => TextFormField(
-    key: ValueKey('$key:${_settings[key] ?? fallback}'),
+    key: ValueKey(key),
     initialValue: '${_settings[key] ?? fallback}',
-    enabled: !_saving,
     keyboardType: TextInputType.number,
     decoration: InputDecoration(
       labelText: title,
@@ -119,8 +216,19 @@ class _DownloadSettingsPageState extends State<DownloadSettingsPage>
     validator: (text) {
       final value = int.tryParse(text ?? '');
       return value == null || value < minimum || value > maximum
-          ? '请输入 $minimum–$maximum 的整数'
+          ? '请输入 $minimum–$maximum 的整数，当前输入尚未保存'
           : null;
+    },
+    onChanged: (text) {
+      final value = int.tryParse(text);
+      _editText(
+        key,
+        value != null && value >= minimum && value <= maximum ? value : null,
+      );
+    },
+    onTapOutside: (_) {
+      unawaited(_flushText());
+      FocusManager.instance.primaryFocus?.unfocus();
     },
     onFieldSubmitted: (text) {
       final value = int.tryParse(text);
@@ -139,6 +247,7 @@ class _DownloadSettingsPageState extends State<DownloadSettingsPage>
         ),
         children: [
           AdaptiveText('下载', style: Theme.of(context).textTheme.titleLarge),
+          const Text('有效输入会自动保存。'),
           const SizedBox(height: 16),
           if (_saving) const LinearProgressIndicator(),
           if (_error != null)
@@ -154,7 +263,7 @@ class _DownloadSettingsPageState extends State<DownloadSettingsPage>
           Align(
             alignment: Alignment.centerLeft,
             child: OutlinedButton.icon(
-              onPressed: _saving ? null : _directory,
+              onPressed: _directory,
               icon: const Icon(Icons.folder_open),
               label: const Text('选择目录'),
             ),
@@ -163,7 +272,7 @@ class _DownloadSettingsPageState extends State<DownloadSettingsPage>
             contentPadding: EdgeInsets.zero,
             title: const Text('按专辑建立文件夹'),
             value: _settings['albumFolders'] as bool? ?? true,
-            onChanged: _saving ? null : (value) => _set('albumFolders', value),
+            onChanged: (value) => _set('albumFolders', value),
           ),
           _number('parallelism', '同时下载数量', 3, 1, 6),
           const SizedBox(height: 16),
@@ -186,45 +295,34 @@ class _DownloadSettingsPageState extends State<DownloadSettingsPage>
               DropdownMenuItem(value: 'mp3_32', child: Text('MP3 32 kbps')),
               DropdownMenuItem(value: 'm4a_24', child: Text('M4A 24 kbps')),
             ],
-            onChanged: _saving
-                ? null
-                : (value) {
-                    if (value != null) _set('quality', value);
-                  },
+            onChanged: (value) {
+              if (value != null) _set('quality', value);
+            },
           ),
           const SizedBox(height: 16),
           TextFormField(
-            key: ValueKey(_settings['filenamePattern']),
+            key: const ValueKey('filenamePattern'),
             initialValue:
                 _settings['filenamePattern'] as String? ??
                 '{index} - {title} [{trackId}]',
-            enabled: !_saving,
             decoration: const InputDecoration(
               labelText: '文件名格式',
               helperText: '{index} {title} {trackId} {album} {albumId}',
               helperMaxLines: 2,
+              errorMaxLines: 3,
             ),
+            autovalidateMode: AutovalidateMode.onUserInteraction,
+            validator: _filenameError,
+            onChanged: (value) => _editText(
+              'filenamePattern',
+              _filenameError(value) == null ? value : null,
+            ),
+            onTapOutside: (_) {
+              unawaited(_flushText());
+              FocusManager.instance.primaryFocus?.unfocus();
+            },
             onFieldSubmitted: (value) {
-              final tokens = RegExp(r'\{([^{}]+)\}')
-                  .allMatches(value)
-                  .map((match) => match[1]!);
-              if (value.trim().isEmpty ||
-                  tokens.any(
-                    (token) => !const {
-                      'index',
-                      'title',
-                      'trackId',
-                      'album',
-                      'albumId',
-                    }.contains(token),
-                  ) ||
-                  value
-                      .replaceAll(RegExp(r'\{[^{}]+\}'), '')
-                      .contains(RegExp(r'[{}]'))) {
-                setState(() {
-                  _error = '文件名格式包含无效变量';
-                });
-              } else {
+              if (_filenameError(value) == null) {
                 _set('filenamePattern', value);
               }
             },
@@ -239,28 +337,37 @@ class _DownloadSettingsPageState extends State<DownloadSettingsPage>
               DropdownMenuItem(value: 'overwrite', child: Text('新文件完成后替换')),
               DropdownMenuItem(value: 'number', child: Text('自动加编号')),
             ],
-            onChanged: _saving
-                ? null
-                : (value) {
-                    if (value != null) _set('conflict', value);
-                  },
+            onChanged: (value) {
+              if (value != null) _set('conflict', value);
+            },
           ),
           const SizedBox(height: 16),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('暂停播放时同步暂停下载'),
             value: _settings['pauseDownloadWithPlayback'] as bool? ?? false,
-            onChanged: _saving
-                ? null
-                : (value) => _set('pauseDownloadWithPlayback', value),
+            onChanged: (value) => _set('pauseDownloadWithPlayback', value),
           ),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('定时结束后继续下载'),
             value: _settings['continueDownloadAfterSleep'] as bool? ?? false,
-            onChanged: _saving
-                ? null
-                : (value) => _set('continueDownloadAfterSleep', value),
+            onChanged: (value) => _set('continueDownloadAfterSleep', value),
+          ),
+          const Divider(),
+          const ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.link_off),
+            title: Text('播放地址缓存'),
+            subtitle: Text('清除所有账号及匿名播放地址，下次使用时重新获取；不删除已下载音频。'),
+          ),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton.icon(
+              onPressed: _clearingUrlCache ? null : _clearUrlCache,
+              icon: const Icon(Icons.delete_outline),
+              label: Text(_clearingUrlCache ? '正在清除…' : '清除所有 URL 缓存'),
+            ),
           ),
           if (Platform.isAndroid) ...[
             const Divider(),

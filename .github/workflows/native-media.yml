@@ -83,7 +83,10 @@ jobs:
         with:
           persist-credentials: false
       - name: Install native build tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y build-essential cmake ninja-build meson pkg-config autoconf automake libtool nasm unzip zip python3-venv
+        run: |
+          printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential cmake ninja-build meson pkg-config autoconf automake libtool nasm unzip zip python3-venv
       - name: Install pinned build-only Python helpers
         run: |
           python3 -m venv "$RUNNER_TEMP/native-build-python"

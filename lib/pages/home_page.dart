@@ -319,7 +319,7 @@ class _HomePageState extends State<HomePage> {
                           OutlinedButton(
                             onPressed: _busy
                                 ? null
-                                : _pageId == null
+                                : _pageId == null || _channels.isEmpty
                                 ? _loadChannels
                                 : () => _loadHome(_pageId!, tabId: _tabId),
                             child: const Text('重试'),

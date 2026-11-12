@@ -83,7 +83,7 @@ class XmlyRewards {
   }
 
   Future<Map<String, dynamic>> claim(Map<String, dynamic> value) =>
-      _lock.synchronized(() => _claim(value));
+      _lock.synchronized(() => client.withBalanceChange(() => _claim(value)));
 
   Future<Map<String, dynamic>> _claim(Map<String, dynamic> value) async {
     final payload = _payload(value);
@@ -97,19 +97,27 @@ class XmlyRewards {
 
   /// Automatic issuance is opt-in. Read-only quota/login/resolve never invoke it.
   /// An error returns the last verified balance, and never retries that claim.
-  Future<Quota> refresh() => _lock.synchronized(() async {
+  Future<Quota> refresh({bool Function()? shouldContinue}) => _lock.synchronized(() async {
+    bool allowed() => automaticEnabled && (shouldContinue?.call() ?? true);
     var quota = await client.queryQuota();
     lastError = '';
-    if (!automaticEnabled || quota.remainingSeconds >= 7200) return quota;
+    if (!allowed() || quota.remainingSeconds >= 7200) return quota;
     final identity = client.cacheIdentity;
     // ponytail: cap each explicit refresh at 64 successful claims; require a
     // later refresh rather than letting a pathological 1-second reward loop run.
-    for (var count = 0; count < 64 && automaticEnabled &&
+    for (var count = 0; count < 64 && allowed() &&
         quota.remainingSeconds < 14400; count++) {
       if (identity != client.cacheIdentity || !client.accountAvailable) break;
       final previous = quota.remainingSeconds;
       try {
-        await _claim({});
+        final claimed = await client.withBalanceChange(() async {
+          // Consent may be revoked while a debit holds the balance lock.
+          if (!allowed() || identity != client.cacheIdentity ||
+              !client.accountAvailable) return false;
+          await _claim({});
+          return true;
+        });
+        if (!claimed) break;
         if (identity != client.cacheIdentity || !client.accountAvailable) break;
         quota = await client.queryQuota();
       } on Exception {

@@ -6,10 +6,13 @@ import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 
 import '../api/xmly_catalogue.dart';
+import '../api/xmly_client.dart';
+import '../api/xmly_experience.dart';
 import '../common/widgets/adaptive_text.dart';
 import '../models/xmly_models.dart';
 import '../services/app_runtime.dart';
 import '../services/download_service.dart';
+import 'album_introduction.dart';
 import 'download_page.dart'
     show
         deleteDownloadedAudio,
@@ -27,6 +30,26 @@ typedef AlbumPlayback = Future<void> Function(
   Track? track,
 });
 
+int? _trackOrdinal(Track track) =>
+    track.officialPosition ?? xmlyPositive(track.orderNo);
+
+Future<Track> _locateAlbumTrack(
+  XmlyClient client,
+  String albumId,
+  Track track,
+) async {
+  final id = track.id;
+  if (_trackOrdinal(track) == null) track = await client.track(track.id);
+  final ordinal = _trackOrdinal(track);
+  if (track.id != id ||
+      track.albumId != albumId ||
+      ordinal == null ||
+      ordinal > 5000) {
+    throw const XmlyException('track_position_missing', '无法确定这集在专辑中的位置，请刷新后重试');
+  }
+  return track;
+}
+
 class DiscoveryPage extends StatefulWidget {
   const DiscoveryPage({
     required this.runtime,
@@ -43,13 +66,17 @@ class DiscoveryPage extends StatefulWidget {
 
 class _DiscoveryPageState extends State<DiscoveryPage> {
   final _query = TextEditingController();
+  final _scroll = ScrollController();
   String _kind = 'album';
   SearchPage? _result;
+  String? _resultQuery;
   String? _error;
   bool _loading = false;
   int _generation = 0;
+  int _playRequest = 0;
 
-  Future<void> _search([int page = 1]) async {
+  Future<void> _search({int page = 1, String? query}) async {
+    final submittedQuery = query ?? _query.text;
     final generation = ++_generation;
     setState(() {
       _loading = true;
@@ -57,15 +84,22 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     });
     try {
       final result = await widget.runtime.client.search(
-        _query.text,
+        submittedQuery,
         kind: _kind,
         page: page,
         pageSize: 30,
       );
-      if (mounted && generation == _generation)
+      if (mounted && generation == _generation) {
         setState(() {
           _result = result;
+          _resultQuery = submittedQuery;
         });
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && generation == _generation && _scroll.hasClients) {
+            _scroll.jumpTo(_scroll.position.minScrollExtent);
+          }
+        });
+      }
     } catch (error) {
       if (mounted && generation == _generation)
         setState(() {
@@ -79,12 +113,13 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     }
   }
 
-  void _openAlbum(String id) {
+  void _openAlbum(String id, {Track? target}) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => AlbumPageView(
           runtime: widget.runtime,
           albumId: id,
+          initialTrack: target,
           onDownload: widget.onDownload,
           onPlayAlbum: widget.onPlayAlbum,
         ),
@@ -92,10 +127,34 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     );
   }
 
+  Future<void> _playResult(Track track) async {
+    final request = ++_playRequest;
+    try {
+      if (track.albumId.isEmpty) {
+        await widget.runtime.player.playTrack(track);
+      } else {
+        final ordinal = _trackOrdinal(track);
+        await (widget.onPlayAlbum ?? widget.runtime.player.playAlbum)(
+          track.albumId,
+          track.id,
+          page: ordinal == null ? null : (ordinal - 1) ~/ xmlyAlbumPageSize + 1,
+          track: track,
+        );
+      }
+    } catch (error) {
+      if (mounted && request == _playRequest) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(_safeError(error))));
+      }
+    }
+  }
+
   @override
   void dispose() {
     _generation++;
+    _playRequest++;
     _query.dispose();
+    _scroll.dispose();
     super.dispose();
   }
 
@@ -106,7 +165,9 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 960),
         child: Scrollbar(
+          controller: _scroll,
           child: CustomScrollView(
+            controller: _scroll,
             slivers: [
               SliverToBoxAdapter(
                 child: Padding(
@@ -147,6 +208,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                                   : (value) => setState(() {
                                       _kind = value!;
                                       _result = null;
+                                      _resultQuery = null;
                                     }),
                             ),
                           ),
@@ -206,15 +268,48 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                       subtitle: AdaptiveText(
                         '${track.album} · ${_duration(track.duration)}',
                       ),
-                      onTap: track.albumId.isEmpty
-                          ? null
-                          : () => _openAlbum(track.albumId),
-                      trailing: IconButton(
-                        tooltip: '下载',
-                        icon: const Icon(Icons.download_outlined),
-                        onPressed: widget.onDownload == null
-                            ? null
-                            : () => widget.onDownload!([track]),
+                      onTap: () => _playResult(track),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            tooltip: '播放此集',
+                            icon: const Icon(Icons.play_arrow),
+                            onPressed: () => _playResult(track),
+                          ),
+                          PopupMenuButton<String>(
+                            tooltip: '声音操作',
+                            onSelected: (action) async {
+                              if (action == 'album') {
+                                _openAlbum(track.albumId, target: track);
+                              } else {
+                                try {
+                                  await widget.onDownload?.call([track]);
+                                } catch (error) {
+                                  if (context.mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content: Text(_safeError(error)),
+                                      ),
+                                    );
+                                  }
+                                }
+                              }
+                            },
+                            itemBuilder: (_) => [
+                              if (track.albumId.isNotEmpty)
+                                const PopupMenuItem(
+                                  value: 'album',
+                                  child: Text('查看专辑并定位'),
+                                ),
+                              if (widget.onDownload != null)
+                                const PopupMenuItem(
+                                  value: 'download',
+                                  child: Text('下载'),
+                                ),
+                            ],
+                          ),
+                        ],
                       ),
                     );
                   },
@@ -226,7 +321,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                     total: result.total,
                     pageSize: result.pageSize,
                     busy: _loading,
-                    onPage: _search,
+                    onPage: (page) => _search(page: page, query: _resultQuery),
                   ),
                 ),
             ],
@@ -241,12 +336,14 @@ class AlbumPageView extends StatefulWidget {
   const AlbumPageView({
     required this.runtime,
     required this.albumId,
+    this.initialTrack,
     this.onDownload,
     this.onPlayAlbum,
     super.key,
   });
   final AppRuntime runtime;
   final String albumId;
+  final Track? initialTrack;
   final TrackDownload? onDownload;
   final AlbumPlayback? onPlayAlbum;
   @override
@@ -254,10 +351,12 @@ class AlbumPageView extends StatefulWidget {
 }
 
 class _AlbumPageViewState extends State<AlbumPageView> {
+  final _albumScroll = ScrollController();
+  final _headerKey = GlobalKey();
+  String? _targetWarning;
   final _search = TextEditingController();
   final _range = TextEditingController();
   final _selected = <String, Track>{};
-  final _fileChecks = <String, Future<DownloadTask?>>{};
   List<DownloadTask> _observedDownloads = [];
   Set<String> _downloaded = {};
   Object? _observedCache;
@@ -269,16 +368,28 @@ class _AlbumPageViewState extends State<AlbumPageView> {
   bool _showSearch = false, _selectionMode = false, _cachedView = false;
   String? _error;
   String _filter = '';
+  XmlyClient? _libraryClient;
+  String? _libraryKey, _subscriptionError;
+  int _libraryRevision = -1, _subscriptionRequest = 0, _accountEpoch = 0;
+  bool? _subscribed;
+  bool _subscriptionBusy = false, _favoriteBusy = false;
+  bool _subscriptionMutating = false;
+  bool _ascending = true;
   static const _pageSize = xmlyAlbumPageSize;
 
   @override
   void initState() {
     super.initState();
+    _ascending =
+        (widget.runtime.storage.state['settings']
+            as Map)['catalogueAscending'] !=
+        false;
     widget.runtime.addListener(_runtimeChanged);
     _downloaded = _completedTrackIds();
     _restoreCache();
-    _loadPage(1);
+    _loadPage(1, target: widget.initialTrack);
     _scanUpdates();
+    _loadSubscription();
   }
 
   @override
@@ -287,11 +398,19 @@ class _AlbumPageViewState extends State<AlbumPageView> {
     _generation++;
     _search.dispose();
     _range.dispose();
+    _albumScroll.dispose();
     super.dispose();
   }
 
   void _runtimeChanged() {
     if (!mounted) return;
+    final client = widget.runtime.client;
+    final accountChanged =
+        !identical(client, _libraryClient) ||
+        client.cacheIdentity != _libraryKey;
+    if (accountChanged) _accountEpoch++;
+    final libraryChanged = widget.runtime.libraryRevision != _libraryRevision;
+    _libraryRevision = widget.runtime.libraryRevision;
     final downloads = widget.runtime.downloads.tasks;
     final cached = widget.runtime.albumCache[widget.albumId];
     setState(() {
@@ -301,10 +420,12 @@ class _AlbumPageViewState extends State<AlbumPageView> {
         _observedCache = cached;
         _downloaded = _completedTrackIds();
         _selected.removeWhere((id, _) => _downloaded.contains(id));
-        _fileChecks.clear();
         if (_cachedView) _showCached(_page);
       }
     });
+    if (accountChanged || (libraryChanged && !_subscriptionMutating)) {
+      _loadSubscription();
+    }
   }
 
   List<Track> _cachedTracks() {
@@ -336,16 +457,18 @@ class _AlbumPageViewState extends State<AlbumPageView> {
           artist: tracks.first.artist,
           coverUrl: tracks.first.coverUrl,
         );
-    _showCached(1);
+    _showCached(1, orderedTracks: _orderedForDisplay(tracks));
   }
 
-  void _showCached(int page) {
+  void _showCached(int page, {List<Track>? orderedTracks}) {
     _cachedView = true;
-    final tracks = _cachedTracks()
-        .where(
-          (track) => track.title.toLowerCase().contains(_filter.toLowerCase()),
-        )
-        .toList();
+    final ordered = orderedTracks ?? _orderedForDisplay(_cachedTracks());
+    final filter = _filter.toLowerCase();
+    final tracks = filter.isEmpty
+        ? ordered
+        : ordered
+              .where((track) => track.title.toLowerCase().contains(filter))
+              .toList();
     _total = tracks.length;
     _page = page.clamp(
       1,
@@ -397,13 +520,108 @@ class _AlbumPageViewState extends State<AlbumPageView> {
     _selectionMode = false;
   }
 
-  bool _favorite(Track track) {
-    final library =
-        (widget.runtime.storage.state['library']
-                as Map?)?[widget.runtime.player.libraryIdentity]
-            as Map?;
-    return (library?['favorites'] as Map?)?.containsKey(track.id) == true;
+  bool _sameAccount(XmlyClient client, String key) =>
+      mounted &&
+      identical(client, widget.runtime.client) &&
+      key == widget.runtime.client.cacheIdentity;
+
+  Future<void> _loadSubscription() async {
+    final client = widget.runtime.client,
+        key = widget.runtime.client.cacheIdentity;
+    final request = ++_subscriptionRequest;
+    _libraryClient = client;
+    _libraryKey = key;
+    _libraryRevision = widget.runtime.libraryRevision;
+    setState(() {
+      _subscribed = null;
+      _subscriptionError = null;
+      _subscriptionBusy = client.accountAvailable;
+      _subscriptionMutating = false;
+    });
+    if (!client.accountAvailable) return;
+    try {
+      final subscribed = await XmlyExperience(client)
+          .isSubscribed(widget.albumId);
+      if (_sameAccount(client, key) && request == _subscriptionRequest) {
+        setState(() => _subscribed = subscribed);
+      }
+    } catch (error) {
+      if (_sameAccount(client, key) && request == _subscriptionRequest) {
+        setState(() => _subscriptionError = _safeError(error));
+      }
+    } finally {
+      if (_sameAccount(client, key) && request == _subscriptionRequest) {
+        setState(() => _subscriptionBusy = false);
+      }
+    }
   }
+
+  Future<void> _changeSubscription() async {
+    if (_subscriptionBusy) return;
+    final client = widget.runtime.client,
+        key = widget.runtime.client.cacheIdentity;
+    if (!client.accountAvailable) {
+      setState(() => _subscriptionError = '请先登录后订阅专辑');
+      return;
+    }
+    final subscribed = _subscribed;
+    if (subscribed == null) return _loadSubscription();
+    final desired = !subscribed, request = ++_subscriptionRequest;
+    var attempted = false;
+    setState(() {
+      _subscriptionBusy = true;
+      _subscriptionMutating = true;
+      _subscriptionError = null;
+    });
+    try {
+      await widget.runtime.accounts.runWithAccount(client.identity, (
+        admitted,
+      ) async {
+        if (!_sameAccount(client, key) || !identical(admitted, client)) {
+          throw const XmlyException('account_changed', '账号已变更，请重试');
+        }
+        attempted = true;
+        await XmlyExperience(client)
+            .setSubscribed(widget.albumId, subscribed: desired);
+      });
+      widget.runtime.libraryChanged();
+      if (_sameAccount(client, key) && request == _subscriptionRequest) {
+        setState(() => _subscribed = desired);
+      }
+    } catch (error) {
+      if (attempted) widget.runtime.libraryChanged();
+      if (!_sameAccount(client, key) || request != _subscriptionRequest) return;
+      setState(() {
+        _subscribed = null;
+        _subscriptionError = _safeError(error);
+      });
+      try {
+        final value = await XmlyExperience(client).isSubscribed(widget.albumId);
+        if (_sameAccount(client, key) && request == _subscriptionRequest) {
+          setState(() => _subscribed = value);
+        }
+      } catch (_) {
+        // Keep the unknown state and offer an explicit status retry.
+      }
+    } finally {
+      if (_sameAccount(client, key) && request == _subscriptionRequest) {
+        setState(() {
+          _subscriptionBusy = false;
+          _subscriptionMutating = false;
+        });
+      }
+    }
+  }
+
+  String get _subscriptionLabel => _subscriptionBusy
+      ? '正在读取订阅状态'
+      : !widget.runtime.client.accountAvailable
+      ? '订阅（需登录）'
+      : _subscribed == null
+      ? '重试订阅状态'
+      : _subscribed!
+      ? '取消订阅'
+      : '订阅专辑';
 
   void _scanUpdates() {
     for (final identity in widget.runtime.accounts.accountIds) {
@@ -433,23 +651,64 @@ class _AlbumPageViewState extends State<AlbumPageView> {
     }
   }
 
-  Future<void> _loadPage(int page) async {
+  double get _trackExtent =>
+      (MediaQuery.textScalerOf(context).scale(16) * 2 + 32).clamp(
+        76.0,
+        double.infinity,
+      );
+
+  void _revealTarget(Track target, int generation) {
+    final index = _visible.indexWhere((track) => track.id == target.id);
+    if (index < 0) {
+      setState(() => _targetWarning = '当前目录没有找到这集，目标信息已保留，可重新定位。');
+      return;
+    }
+    setState(() => _targetWarning = null);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || generation != _generation || !_albumScroll.hasClients)
+        return;
+      final header = _headerKey.currentContext?.findRenderObject();
+      if (header is! RenderBox || !header.hasSize) return;
+      final offset = header.size.height + index * _trackExtent;
+      _albumScroll.jumpTo(
+        offset.clamp(
+          _albumScroll.position.minScrollExtent,
+          _albumScroll.position.maxScrollExtent,
+        ),
+      );
+    });
+  }
+
+  Future<void> _loadPage(int page, {Track? target}) async {
     if (_offline) {
-      setState(() => _showCached(page));
+      final tracks = _orderedForDisplay(_cachedTracks());
+      if (target != null) {
+        final index = tracks.indexWhere((track) => track.id == target.id);
+        if (index >= 0) page = index ~/ _pageSize + 1;
+      }
+      setState(() => _showCached(page, orderedTracks: tracks));
+      if (target != null) _revealTarget(target, _generation);
       return;
     }
     final generation = ++_generation;
+    final client = widget.runtime.client,
+        key = widget.runtime.client.cacheIdentity;
     setState(() {
       _busy = true;
       _error = null;
     });
     try {
+      int? targetOrdinal;
+      if (target != null) {
+        final located = await _locateAlbumTrack(client, widget.albumId, target);
+        if (!_sameAccount(client, key) || generation != _generation) return;
+        targetOrdinal = _trackOrdinal(located)!;
+        page = (targetOrdinal - 1) ~/ _pageSize + 1;
+      }
       if (_filter.isNotEmpty && _complete != null) {
-        final filtered = _complete!
-            .where(
-              (track) =>
-                  track.title.toLowerCase().contains(_filter.toLowerCase()),
-            )
+        final filter = _filter.toLowerCase();
+        final filtered = _orderedForDisplay(_complete!)
+            .where((track) => track.title.toLowerCase().contains(filter))
             .toList();
         if (mounted && generation == _generation) {
           setState(() {
@@ -462,47 +721,129 @@ class _AlbumPageViewState extends State<AlbumPageView> {
           });
         }
       } else {
-        final result = await widget.runtime.client.album(
+        var result = await client.album(
           widget.albumId,
           page: page,
           pageSize: _pageSize,
+          ascending: _ascending,
         );
-        try {
-          await widget.runtime.albumCache.remember(result);
-        } catch (_) {
-          // Cache metadata and artwork are nonessential to the live request.
+        if (!_sameAccount(client, key) || generation != _generation) return;
+        if (!_ascending &&
+            targetOrdinal != null &&
+            targetOrdinal <= result.total) {
+          final targetPage = (result.total - targetOrdinal) ~/ _pageSize + 1;
+          if (targetPage != page) {
+            page = targetPage;
+            result = await client.album(
+              widget.albumId,
+              page: page,
+              pageSize: _pageSize,
+              ascending: false,
+            );
+          }
         }
-        if (mounted && generation == _generation) {
+        if (_sameAccount(client, key) && generation == _generation) {
           setState(() {
             _offline = false;
             _cachedView = false;
+            _complete = null;
             _album = result.album;
             _page = page;
             _total = result.total;
             _visible = result.tracks;
           });
+          if (target != null) _revealTarget(target, generation);
+          unawaited(_rememberPage(result));
         }
       }
     } catch (error) {
-      if (mounted && generation == _generation) {
+      if (_sameAccount(client, key) && generation == _generation) {
         setState(() {
           _restoreCache();
           _offline = _album != null;
           _error = _offline ? null : _safeError(error);
+          if (target != null) _targetWarning = '暂时无法定位这集，目标信息已保留，请重新定位。';
         });
+        if (_offline && target != null) {
+          final index = _orderedForDisplay(_cachedTracks())
+              .indexWhere((track) => track.id == target.id);
+          if (index >= 0) {
+            setState(() => _showCached(index ~/ _pageSize + 1));
+            _revealTarget(target, generation);
+          }
+        }
       }
     } finally {
       if (mounted && generation == _generation) setState(() => _busy = false);
     }
   }
 
+  Future<void> _rememberPage(AlbumPage page) async {
+    try {
+      await widget.runtime.albumCache.remember(page);
+    } catch (_) {
+      // Optional cache failures never delay or replace the live catalogue.
+    }
+  }
+
+  List<Track> _orderedForDisplay(List<Track> tracks) =>
+      _ascending ? tracks : tracks.reversed.toList();
+
+  Future<void> _setOrder(bool ascending) async {
+    if (_busy || _ascending == ascending) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await widget.runtime.storage.transaction((state) {
+        (state['settings'] as Map)['catalogueAscending'] = ascending;
+      });
+      if (!mounted) return;
+      setState(() {
+        _ascending = ascending;
+        _selected.clear();
+      });
+      await _loadPage(1);
+      if (mounted && _albumScroll.hasClients) {
+        _albumScroll.jumpTo(_albumScroll.position.minScrollExtent);
+      }
+    } catch (_) {
+      if (mounted) setState(() => _error = '目录排序保存失败，请重试');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  List<PopupMenuEntry<String>> _orderMenu() => [
+    CheckedPopupMenuItem(
+      value: 'ascending',
+      checked: _ascending,
+      enabled: !_busy,
+      child: const Text('最早在前'),
+    ),
+    CheckedPopupMenuItem(
+      value: 'descending',
+      checked: !_ascending,
+      enabled: !_busy,
+      child: const Text('最新在前'),
+    ),
+  ];
+
   Future<List<Track>> _all() async {
     if (_complete != null) return _complete!;
     if (_offline) {
       throw const XmlyException('offline_catalogue', '离线目录不完整，无法按完整专辑下载');
     }
-    final tracks = await XmlyCatalogue(widget.runtime.client)
-        .album(widget.albumId);
+    final generation = _generation, client = widget.runtime.client;
+    final identity = client.cacheIdentity;
+    final tracks = await XmlyCatalogue(client).album(widget.albumId);
+    if (!mounted ||
+        generation != _generation ||
+        !identical(client, widget.runtime.client) ||
+        identity != widget.runtime.client.cacheIdentity) {
+      throw const XmlyException('catalogue_changed', '专辑目录已变化，请重新操作');
+    }
     _complete = tracks;
     return tracks;
   }
@@ -532,6 +873,8 @@ class _AlbumPageViewState extends State<AlbumPageView> {
 
   Future<void> _download({bool all = false}) async {
     if (_busy) return;
+    final range = _range.text.trim();
+    final selected = _selected.values.toList();
     setState(() {
       _busy = true;
       _error = null;
@@ -541,9 +884,9 @@ class _AlbumPageViewState extends State<AlbumPageView> {
         await requestAlbumDownloads(context, widget.runtime, widget.albumId);
         return;
       }
-      final requested = _range.text.trim().isNotEmpty
-          ? XmlyCatalogue.selectRange(await _all(), _range.text)
-          : _selected.values.toList();
+      final requested = range.isNotEmpty
+          ? XmlyCatalogue.selectRange(await _all(), range)
+          : selected;
       final downloaded = _completedTrackIds();
       final tracks = requested
           .where((track) => !downloaded.contains(track.id))
@@ -560,21 +903,21 @@ class _AlbumPageViewState extends State<AlbumPageView> {
   }
 
   Future<void> _play(Track track) async {
-    final task = await _localDownload(track);
-    if (!mounted) return;
-    if (task != null) {
+    if (_offline) {
+      final task = await _localDownload(track);
+      if (!mounted) return;
+      if (task == null)
+        throw const XmlyException('offline_playback', '此声音本地文件不存在，请重新下载后播放');
       await widget.runtime.player.playLocal(task.id);
       return;
     }
-    if (_offline)
-      throw const XmlyException('offline_playback', '此声音本地文件不存在，请重新下载后播放');
     if (widget.onPlayAlbum != null) {
       final position = track.officialPosition;
       await widget.onPlayAlbum!(
         widget.albumId,
         track.id,
         page: position == null
-            ? (_filter.isEmpty ? _page : null)
+            ? (_filter.isEmpty && _ascending ? _page : null)
             : (position - 1) ~/ _pageSize + 1,
         track: track,
       );
@@ -593,51 +936,126 @@ class _AlbumPageViewState extends State<AlbumPageView> {
         await _play(track);
       case 'queue':
         await widget.runtime.player.addToQueue(track);
+      case 'next':
+        await widget.runtime.player.playNext(track);
       case 'download':
-        if (!_completedTrackIds().contains(track.id))
+        final task = await _localDownload(track);
+        if (mounted && task == null)
           await requestDownloads(context, widget.runtime, [track]);
       case 'delete':
         final task = await _localDownload(track);
-        if (mounted &&
-            task != null &&
-            await deleteDownloadedAudio(context, widget.runtime, task)) {
-          _fileChecks.remove(track.id);
+        if (mounted && task != null) {
+          await deleteDownloadedAudio(context, widget.runtime, task);
         }
-      case 'favorite':
-        await widget.runtime.player.toggleFavorite(track);
     }
     if (mounted) setState(() {});
   }
 
-  Widget _menu(Track track) => FutureBuilder<DownloadTask?>(
-    future: _fileChecks.putIfAbsent(track.id, () => _localDownload(track)),
-    builder: (context, snapshot) => PopupMenuButton<String>(
+  Widget _menu(Track track) => Builder(
+    builder: (menuContext) => IconButton(
       tooltip: '声音操作',
-      enabled: !_busy,
-      onSelected: (value) => unawaited(
-        _trackAction(track, value).catchError((error) {
-          if (mounted) setState(() => _error = _safeError(error));
-        }),
-      ),
-      itemBuilder: (_) => [
-        const PopupMenuItem(value: 'play', child: Text('播放')),
-        const PopupMenuItem(value: 'queue', child: Text('加入播放队列')),
-        if (snapshot.data != null)
-          const PopupMenuItem(value: 'delete', child: Text('删除已下载文件'))
-        else if (!_downloaded.contains(track.id))
-          const PopupMenuItem(value: 'download', child: Text('下载')),
-        PopupMenuItem(
-          value: 'favorite',
-          child: Text(_favorite(track) ? '取消收藏' : '收藏'),
-        ),
-      ],
+      icon: const Icon(Icons.more_vert),
+      onPressed: _busy || _favoriteBusy
+          ? null
+          : () => _openTrackMenu(menuContext, track),
     ),
   );
 
+  Future<void> _openTrackMenu(BuildContext menuContext, Track track) async {
+    final client = widget.runtime.client,
+        key = widget.runtime.client.cacheIdentity;
+    final epoch = _accountEpoch;
+    bool current() => _sameAccount(client, key) && epoch == _accountEpoch;
+    final anchor = menuContext.findRenderObject()! as RenderBox;
+    final overlay =
+        Overlay.of(menuContext).context.findRenderObject()! as RenderBox;
+    final position = RelativeRect.fromRect(
+      Rect.fromPoints(
+        anchor.localToGlobal(Offset.zero, ancestor: overlay),
+        anchor.localToGlobal(
+          anchor.size.bottomRight(Offset.zero),
+          ancestor: overlay,
+        ),
+      ),
+      Offset.zero & overlay.size,
+    );
+    setState(() => _favoriteBusy = true);
+    try {
+      final task = await _localDownload(track);
+      if (!current()) return;
+      final action = await showMenu<String>(
+        context: context,
+        position: position,
+        items: [
+          const PopupMenuItem(value: 'play', child: Text('播放')),
+          const PopupMenuItem(value: 'queue', child: Text('加入播放队列')),
+          const PopupMenuItem(value: 'next', child: Text('下一集播放')),
+          if (task != null)
+            const PopupMenuItem(value: 'delete', child: Text('删除已下载文件'))
+          else
+            const PopupMenuItem(value: 'download', child: Text('下载')),
+          if (client.accountAvailable)
+            _FavoriteMenuItem(client: client, trackId: track.id)
+          else
+            const PopupMenuItem(value: 'favorite', child: Text('收藏（需登录）')),
+        ],
+      );
+      if (!current() || action == null) return;
+      if (action == 'retryFavorite') {
+        setState(() => _favoriteBusy = false);
+        if (menuContext.mounted) await _openTrackMenu(menuContext, track);
+        return;
+      }
+      if (action != 'favorite' && action != 'unfavorite') {
+        await _trackAction(track, action);
+        return;
+      }
+      if (!client.accountAvailable) {
+        setState(() => _error = '请先登录后收藏声音');
+        return;
+      }
+      final desired = action == 'favorite';
+      var attempted = false;
+      try {
+        await widget.runtime.accounts.runWithAccount(client.identity, (
+          admitted,
+        ) async {
+          if (!current() || !identical(admitted, client)) {
+            throw const XmlyException('account_changed', '账号已变更，请重试');
+          }
+          attempted = true;
+          await XmlyExperience(client).setFavorite(track, favorite: desired);
+        });
+        widget.runtime.libraryChanged();
+      } catch (error) {
+        if (attempted) widget.runtime.libraryChanged();
+        if (!current()) return;
+        setState(() => _error = _safeError(error));
+        // Reconcile an uncertain write without replaying the mutation.
+        if (attempted) {
+          try {
+            await XmlyExperience(client).isFavorite(track.id);
+          } catch (_) {}
+        }
+      }
+    } catch (error) {
+      if (current()) setState(() => _error = _safeError(error));
+    } finally {
+      if (mounted) setState(() => _favoriteBusy = false);
+    }
+  }
+
   void _albumAction(String action) {
     switch (action) {
+      case 'ascending':
+        _setOrder(true);
+      case 'descending':
+        _setOrder(false);
+      case 'subscribe':
+        _changeSubscription();
       case 'refresh':
         _offline = false;
+        _complete = null;
         _filter = '';
         _search.clear();
         _loadPage(1);
@@ -652,14 +1070,11 @@ class _AlbumPageViewState extends State<AlbumPageView> {
           ),
         );
       case 'settings':
-        Navigator.of(context).push(
-          MaterialPageRoute<void>(
-            builder: (_) => PlaybackSettingsPage(
-              runtime: widget.runtime,
-              albumId: widget.albumId,
-              albumTitle: _album?.title,
-            ),
-          ),
+        showQuickPlaybackSettings(
+          context,
+          widget.runtime,
+          albumId: widget.albumId,
+          albumTitle: _album?.title,
         );
     }
   }
@@ -695,6 +1110,13 @@ class _AlbumPageViewState extends State<AlbumPageView> {
               tooltip: '更多操作',
               onSelected: _albumAction,
               itemBuilder: (_) => [
+                ..._orderMenu(),
+                const PopupMenuDivider(),
+                PopupMenuItem(
+                  value: 'subscribe',
+                  enabled: !_subscriptionBusy,
+                  child: Text(_subscriptionLabel),
+                ),
                 if (_offline)
                   PopupMenuItem(
                     value: 'refresh',
@@ -706,6 +1128,12 @@ class _AlbumPageViewState extends State<AlbumPageView> {
               ],
             )
           else ...[
+            PopupMenuButton<String>(
+              tooltip: '目录排序：${_ascending ? "最早在前" : "最新在前"}',
+              icon: const Icon(Icons.sort),
+              onSelected: _albumAction,
+              itemBuilder: (_) => _orderMenu(),
+            ),
             IconButton(
               tooltip: '专辑标签',
               icon: const Icon(Icons.edit_note),
@@ -721,15 +1149,42 @@ class _AlbumPageViewState extends State<AlbumPageView> {
       ),
       body: SafeArea(
         top: false,
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 960),
-            child: Scrollbar(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final padding = EdgeInsets.symmetric(
+              horizontal: ((constraints.maxWidth - 960) / 2).clamp(
+                0.0,
+                double.infinity,
+              ),
+            );
+            return Scrollbar(
+              controller: _albumScroll,
               child: CustomScrollView(
+                controller: _albumScroll,
+                scrollBehavior: ScrollConfiguration.of(context)
+                    .copyWith(scrollbars: false),
                 slivers: [
                   SliverToBoxAdapter(
                     child: Column(
+                      key: _headerKey,
                       children: [
+                        if (widget.initialTrack case final target?)
+                          ListTile(
+                            title: AdaptiveText('搜索目标：${target.title}'),
+                            subtitle: _targetWarning == null
+                                ? null
+                                : Text(_targetWarning!),
+                            trailing: TextButton(
+                              onPressed: _busy
+                                  ? null
+                                  : () {
+                                      _filter = '';
+                                      _search.clear();
+                                      _loadPage(1, target: target);
+                                    },
+                              child: const Text('重新定位'),
+                            ),
+                          ),
                         if (album != null)
                           Padding(
                             padding: EdgeInsets.all(compact ? 8 : 16),
@@ -773,13 +1228,29 @@ class _AlbumPageViewState extends State<AlbumPageView> {
                                         '${album.artist} · ${album.total} 集',
                                       ),
                                       if (album.intro.isNotEmpty)
-                                        Text(
-                                          album.intro,
-                                          maxLines: 3,
-                                          overflow: TextOverflow.ellipsis,
-                                        ),
+                                        AlbumIntroduction(text: album.intro),
                                       if (_cachedView)
                                         const Text('离线缓存（仅显示已观察目录与已下载声音）'),
+                                      OutlinedButton.icon(
+                                        onPressed: _subscriptionBusy
+                                            ? null
+                                            : _changeSubscription,
+                                        icon: Icon(
+                                          _subscribed == true
+                                              ? Icons.check_circle_outline
+                                              : Icons.add_circle_outline,
+                                        ),
+                                        label: Text(_subscriptionLabel),
+                                      ),
+                                      if (_subscriptionError != null)
+                                        Text(
+                                          _subscriptionError!,
+                                          style: TextStyle(
+                                            color: Theme.of(context)
+                                                .colorScheme
+                                                .error,
+                                          ),
+                                        ),
                                     ],
                                   ),
                                 ),
@@ -822,6 +1293,12 @@ class _AlbumPageViewState extends State<AlbumPageView> {
                               ],
                             ),
                           ),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16),
+                          child: Text(
+                            '${_ascending ? "最早在前" : "最新在前"} · 连播按集数正序',
+                          ),
+                        ),
                         if (_showSearch)
                           Padding(
                             padding: EdgeInsets.symmetric(
@@ -931,12 +1408,14 @@ class _AlbumPageViewState extends State<AlbumPageView> {
                       ],
                     ),
                   ),
-                  SliverList.builder(
+                  SliverFixedExtentList.builder(
+                    itemExtent: _trackExtent,
                     itemCount: _visible.length,
                     itemBuilder: (_, index) {
                       final track = _visible[index];
                       final downloaded = _downloaded.contains(track.id);
                       return ListTile(
+                        selected: track.id == widget.initialTrack?.id,
                         leading: _selectionMode
                             ? Checkbox(
                                 value: _selected.containsKey(track.id),
@@ -992,14 +1471,66 @@ class _AlbumPageViewState extends State<AlbumPageView> {
                       onPage: _loadPage,
                     ),
                   ),
-                ],
+                ].map((sliver) => SliverPadding(padding: padding, sliver: sliver)).toList(),
               ),
-            ),
-          ),
+            );
+          },
         ),
       ),
     );
   }
+}
+
+class _FavoriteMenuItem extends PopupMenuEntry<String> {
+  const _FavoriteMenuItem({required this.client, required this.trackId});
+
+  final XmlyClient client;
+  final String trackId;
+
+  @override
+  double get height => kMinInteractiveDimension;
+
+  @override
+  bool represents(String? value) =>
+      const {'favorite', 'unfavorite', 'retryFavorite'}.contains(value);
+
+  @override
+  State<_FavoriteMenuItem> createState() => _FavoriteMenuItemState();
+}
+
+class _FavoriteMenuItemState extends State<_FavoriteMenuItem> {
+  late final Future<bool> _favorite;
+
+  @override
+  void initState() {
+    super.initState();
+    _favorite = XmlyExperience(widget.client).isFavorite(widget.trackId);
+  }
+
+  @override
+  Widget build(BuildContext context) => FutureBuilder<bool>(
+    future: _favorite,
+    builder: (context, snapshot) {
+      final ready = snapshot.connectionState == ConnectionState.done;
+      return PopupMenuItem<String>(
+        enabled: ready,
+        value: snapshot.hasError
+            ? 'retryFavorite'
+            : snapshot.data == true
+            ? 'unfavorite'
+            : 'favorite',
+        child: Text(
+          !ready
+              ? '正在读取收藏状态…'
+              : snapshot.hasError
+              ? '重试收藏状态'
+              : snapshot.data == true
+              ? '取消收藏'
+              : '收藏',
+        ),
+      );
+    },
+  );
 }
 
 class CoverImage extends StatelessWidget {

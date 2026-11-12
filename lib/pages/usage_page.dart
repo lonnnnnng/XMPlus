@@ -16,6 +16,36 @@ class UsagePage extends StatefulWidget {
 class _UsagePageState extends State<UsagePage> {
   String? _error;
   bool _busy = false;
+  Map? _accounts;
+
+  @override
+  void initState() {
+    super.initState();
+    _accounts = widget.runtime.storage.state['accounts'] as Map;
+    widget.runtime.addListener(_changed);
+  }
+
+  @override
+  void didUpdateWidget(covariant UsagePage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.runtime != widget.runtime) {
+      oldWidget.runtime.removeListener(_changed);
+      _accounts = widget.runtime.storage.state['accounts'] as Map;
+      widget.runtime.addListener(_changed);
+    }
+  }
+
+  void _changed() {
+    final accounts = widget.runtime.storage.state['accounts'] as Map;
+    if (!mounted || identical(accounts, _accounts)) return;
+    setState(() => _accounts = accounts);
+  }
+
+  @override
+  void dispose() {
+    widget.runtime.removeListener(_changed);
+    super.dispose();
+  }
 
   Future<void> _reconcile(
     String identity,
@@ -23,7 +53,6 @@ class _UsagePageState extends State<UsagePage> {
     int seconds,
     Object? before,
     Object? after,
-    Object? createdAt,
   ) async {
     setState(() {
       _busy = true;
@@ -146,7 +175,6 @@ class _UsagePageState extends State<UsagePage> {
                                           receipt.seconds,
                                           receipt.balanceBefore,
                                           receipt.balanceAfter,
-                                          receipt.createdAt,
                                         ),
                                   child: const Text('核对'),
                                 ),
@@ -186,7 +214,6 @@ class _UsagePageState extends State<UsagePage> {
                                             as int,
                                         pending['balanceBefore'],
                                         pending['balanceAfter'],
-                                        pending['createdAt'],
                                       ),
                                 child: const Text('核对'),
                               ),

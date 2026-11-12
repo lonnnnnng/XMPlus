@@ -10,6 +10,7 @@ import 'package:synchronized/synchronized.dart';
 import '../models/download_task.dart';
 import '../models/xmly_models.dart';
 import 'download_paths.dart';
+import 'file_paths.dart';
 import 'android_platform.dart';
 
 import 'request_diagnostics.dart';
@@ -48,26 +49,17 @@ class MediaProcessor {
   // the data-directory writer lock excludes a second application writer.
   static final Lock _outputs = Lock();
   static const _limit = 2 * 1024 * 1024;
+  static const _coverLimit = 5 * 1024 * 1024;
   static const _protocols = ['-protocol_whitelist', 'file,pipe'];
 
-  static String _tool(String? directory, String name) {
-    final executableDirectory =
-        directory ?? p.dirname(Platform.resolvedExecutable);
-    // long: Mac 辅助程序放在签名认可的 Helpers 目录，移动 .app 后仍可直接使用。
-    if (Platform.isMacOS)
-      return p.normalize(p.join(executableDirectory, '..', 'Helpers', name));
-    return p.join(
-      executableDirectory,
-      'tools',
-      'ffmpeg',
-      '$name${Platform.isWindows ? '.exe' : ''}',
-    );
-  }
+  static String _tool(String? directory, String name) => p.join(
+    directory ?? p.dirname(Platform.resolvedExecutable),
+    'tools',
+    'ffmpeg',
+    '$name${Platform.isWindows ? '.exe' : ''}',
+  );
 
-  Future<void> checkTools({Future<void> Function()? checkpoint}) =>
-      _checkTools(checkpoint);
-
-  Future<void> _checkTools(Future<void> Function()? checkpoint) async {
+  Future<void> checkTools({Future<void> Function()? checkpoint}) async {
     for (final entry in [(ffmpegPath, 'ffmpeg'), (ffprobePath, 'ffprobe')]) {
       final output = await _run(
         entry.$1,
@@ -198,9 +190,20 @@ class MediaProcessor {
   ) async {
     await checkpoint?.call();
     final source = await _localFile(sourcePath);
-    await _checkTools(checkpoint);
+    await checkTools(checkpoint: checkpoint);
     final input = await _probe(source, checkpoint);
     await _decode(source, checkpoint);
+    final expectedDuration = task.track.duration;
+    // Metadata can be rounded and encoder padding can change duration. Reject
+    // substantial missing content before publishing an otherwise valid file.
+    if (expectedDuration > 0 &&
+        expectedDuration - _duration(input) >
+            math.max(5.0, expectedDuration * 0.05)) {
+      throw const XmlyException(
+        'media_incomplete',
+        '音频时长明显短于标注时长，请重新获取音频；已有扣时收据保留',
+      );
+    }
     final sourceAudio = _audio(input);
     final media = xmlyMap(task.settings['media']);
     final tags = xmlyMap(task.settings['tags']);
@@ -218,25 +221,51 @@ class MediaProcessor {
         : format as String;
     final tagging = _boolean(tags, 'enabled', true);
     final coverEnabled = tagging && _boolean(tags, 'cover', false);
+    final originalFormats = '${xmlyMap(input['format'])['format_name']}'.split(
+      ',',
+    );
+    final copyOriginal =
+        format == 'original' && !tagging && originalFormats.contains(extension);
     final download = xmlyMap(task.settings['download']);
     final minimum = download['minimumFreeMiB'] ?? 512;
     if (minimum is! int) throw const XmlyException('invalid_space', '可用空间设置无效');
     final sourceSize = await File(source).length();
-    // Lossless PCM-derived FLAC may be much larger than a compressed source.
-    final pcmReserve =
-        (_duration(input) *
-                (int.tryParse('${sourceAudio['sample_rate']}') ?? 48000) *
-                ((sourceAudio['channels'] as num?)?.toInt() ?? 2) *
-                4)
-            .ceil();
-    await _paths.checkRoot(
-      task.rootDirectory,
-      minimumFreeMiB: minimum,
-      reserveBytes: math.max(sourceSize * 2, pcmReserve),
-    );
     final total =
         xmlyPositive(task.track.raw['totalCount']) ??
         xmlyPositive(task.track.raw['total']);
+    var reserve = sourceSize * 2;
+    if (format == 'original') {
+      // Copy/remux never writes decoded PCM. Keep output/replacement room,
+      // plus temporary/embedded metadata and the bounded cover download.
+      // Even an almost-empty ADTS stream needs MP4 headers and sample tables.
+      if (!copyOriginal) reserve += 1024 * 1024;
+      if (tagging) {
+        // ffprobe output caps retained source tags at _limit. Allow escaped
+        // metadata files as well as the tags embedded in the final container.
+        reserve += 4 * _limit;
+        reserve +=
+            3 * utf8.encode(jsonEncode(_metadata(task, tags, total))).length;
+      }
+      if (coverEnabled &&
+          task.track.coverUrl != null &&
+          const {'mp3', 'm4a', 'm4b', 'flac'}.contains(extension)) {
+        reserve += 2 * _coverLimit;
+      }
+    } else {
+      // Lossless PCM-derived FLAC may be much larger than a compressed source.
+      final pcmReserve =
+          (_duration(input) *
+                  (int.tryParse('${sourceAudio['sample_rate']}') ?? 48000) *
+                  ((sourceAudio['channels'] as num?)?.toInt() ?? 2) *
+                  4)
+              .ceil();
+      reserve = math.max(reserve, pcmReserve);
+    }
+    await _paths.checkRoot(
+      task.rootDirectory,
+      minimumFreeMiB: minimum,
+      reserveBytes: reserve,
+    );
     final target = _paths.targetPath(
       root: task.rootDirectory,
       track: task.track,
@@ -255,6 +284,8 @@ class MediaProcessor {
               'track': task.track.toJson(),
               'media': media,
               'tags': tags,
+              if (tagging) 'metadataEncoding': 1,
+              if (tagging && extension == 'flac') 'flacMetadata': 1,
               'source': sourceDigest,
             }),
           ),
@@ -264,7 +295,7 @@ class MediaProcessor {
         ? await _audioHash(source, checkpoint, details: input)
         : null;
     final warnings = <String>[];
-    return _outputs.synchronized(() async {
+    return _withOutputLock(() async {
       await checkpoint?.call();
       final conflict = download['conflict'] ?? 'skip';
       if (conflict is! String)
@@ -296,7 +327,7 @@ class MediaProcessor {
         target,
         conflict: conflict,
       );
-      if (p.equals(source, p.normalize(p.absolute(destination)))) {
+      if (p.equals(source, absoluteFilePath(destination))) {
         throw const XmlyException('invalid_commit', '源音频不能作为输出文件');
       }
       if (conflict == 'skip' &&
@@ -304,8 +335,13 @@ class MediaProcessor {
               FileSystemEntityType.notFound) {
         throw const XmlyException('destination_exists', '同名文件无法验证，请选择覆盖或添加编号');
       }
-      final temporary = await Directory(p.dirname(destination))
-          .createTemp('.xmplus-media-');
+      // Windows needs the root's verified temporary budget; keep POSIX's
+      // existing destination-directory and same-volume policy unchanged.
+      final temporary = await Directory(
+        Platform.isWindows
+            ? absoluteFilePath(task.rootDirectory)
+            : p.dirname(destination),
+      ).createTemp(DownloadPaths.mediaTemporaryPrefix);
       try {
         final output = p.join(temporary.path, 'output.$extension');
         String? cover;
@@ -382,13 +418,76 @@ class MediaProcessor {
             warnings.add('此格式不支持内嵌封面，已保留音频');
           }
         }
-        final originalFormats = '${xmlyMap(input['format'])['format_name']}'
-            .split(',');
-        if (format == 'original' &&
-            !tagging &&
-            originalFormats.contains(extension)) {
+        if (copyOriginal) {
           await _copy(source, output, checkpoint);
         } else {
+          final metadataPaths = <String>[];
+          if (tagging) {
+            final metadata = <String, String>{
+              for (final entry in xmlyMap(
+                xmlyMap(input['format'])['tags'],
+              ).entries)
+                if (entry.value is String) entry.key: entry.value as String,
+            };
+            final outputTags = _metadata(task, tags, total);
+            if (extension == 'flac') {
+              // Vorbis aliases COMMENT and DESCRIPTION. Use one description
+              // field and a distinct SOURCE URL so conversion cannot overwrite
+              // either value depending on the input metadata's key order.
+              var description = outputTags.remove('description');
+              for (final key in ['description', 'comment']) {
+                for (final entry in metadata.entries) {
+                  if (entry.key.toLowerCase() == key)
+                    description ??= entry.value;
+                }
+              }
+              metadata.removeWhere(
+                (key, _) => const {
+                  'description',
+                  'comment',
+                }.contains(key.toLowerCase()),
+              );
+              outputTags['source'] = outputTags.remove('comment')!;
+              if (description != null) outputTags['comment'] = description;
+            }
+            for (final entry in outputTags.entries) {
+              metadata.removeWhere(
+                (key, _) => key.toLowerCase() == entry.key.toLowerCase(),
+              );
+              if (entry.value.isNotEmpty) metadata[entry.key] = entry.value;
+            }
+            final contents = StringBuffer(';FFMETADATA1\n');
+            final trailing = <MapEntry<String, String>>[];
+            for (final entry in metadata.entries) {
+              if (entry.value.endsWith(r'\')) {
+                trailing.add(entry);
+              } else {
+                contents.writeln(
+                  '${_escapeMetadata(entry.key)}=${_escapeMetadata(entry.value)}',
+                );
+              }
+            }
+            final metadataPath = p.join(temporary.path, 'tags.ffmetadata');
+            await File(
+              metadataPath,
+            ).writeAsString(contents.toString(), encoding: utf8, flush: true);
+            metadataPaths.add(metadataPath);
+            // FFmpeg's FFmetadata reader treats ANY trailing backslash as a
+            // continuation, even a correctly doubled one. End such fields at
+            // EOF in separate inputs; repeated maps merge these disjoint keys.
+            for (final entry in trailing) {
+              final path = p.join(
+                temporary.path,
+                'tag-${metadataPaths.length}',
+              );
+              await File(path).writeAsString(
+                ';FFMETADATA1\n${_escapeMetadata(entry.key)}=${_escapeMetadata(entry.value)}',
+                encoding: utf8,
+                flush: true,
+              );
+              metadataPaths.add(path);
+            }
+          }
           final args = [
             '-v',
             'error',
@@ -398,11 +497,22 @@ class MediaProcessor {
             '-i',
             source,
             if (cover != null) ...[..._protocols, '-i', cover],
+            for (final metadataPath in metadataPaths) ...[
+              ..._protocols,
+              '-f',
+              'ffmetadata',
+              '-i',
+              metadataPath,
+            ],
             '-map',
             '0:a:0',
             if (cover != null) ...['-map', '1:v:0'],
-            '-map_metadata',
-            tagging || format == 'original' ? '0' : '-1',
+            if (metadataPaths.isNotEmpty)
+              for (var index = 0; index < metadataPaths.length; index++) ...[
+                '-map_metadata',
+                '${index + (cover == null ? 1 : 2)}',
+              ]
+            else ...['-map_metadata', format == 'original' ? '0' : '-1'],
             '-map_chapters',
             '-1',
             '-c:a',
@@ -426,7 +536,6 @@ class MediaProcessor {
               '-metadata:s:v:0',
               'comment=Cover (front)',
             ],
-            if (tagging) ..._metadata(task, tags, total),
             if (extension == 'mp3') ...['-id3v2_version', '3'],
             if (const {'m4a', 'm4b'}.contains(extension)) ...[
               '-movflags',
@@ -480,7 +589,7 @@ class MediaProcessor {
         try {
           await _paths.commit(
             manifest.path,
-            '$destination.xmplus-media.json',
+            '$destination${DownloadPaths.mediaManifestSuffix}',
             overwrite: true,
           );
         } catch (_) {
@@ -498,7 +607,48 @@ class MediaProcessor {
           /* Only disposable processor output. */
         }
       }
-    });
+    }, checkpoint);
+  }
+
+  Future<T> _withOutputLock<T>(
+    Future<T> Function() operation,
+    Future<void> Function()? checkpoint,
+  ) async {
+    final result = Completer<T>();
+    var entered = false, checking = false;
+    Timer? timer;
+    // Abandoned waiters must never select a name or touch files later.
+    unawaited(
+      _outputs.synchronized(() async {
+        if (result.isCompleted) return;
+        entered = true;
+        timer?.cancel();
+        try {
+          result.complete(await operation());
+        } catch (error, stack) {
+          result.completeError(error, stack);
+        }
+      }),
+    );
+    if (!entered && checkpoint != null) {
+      timer = Timer.periodic(const Duration(milliseconds: 100), (_) async {
+        if (entered || result.isCompleted || checking) return;
+        checking = true;
+        try {
+          await checkpoint();
+        } catch (error, stack) {
+          if (!entered && !result.isCompleted)
+            result.completeError(error, stack);
+        } finally {
+          checking = false;
+        }
+      });
+    }
+    try {
+      return await result.future;
+    } finally {
+      timer?.cancel();
+    }
   }
 
   Future<Map<String, dynamic>?> _existing(
@@ -514,7 +664,7 @@ class MediaProcessor {
       if (await FileSystemEntity.type(path, followLinks: false) !=
           FileSystemEntityType.file)
         return null;
-      final manifest = File('$path.xmplus-media.json');
+      final manifest = File('$path${DownloadPaths.mediaManifestSuffix}');
       if (!await manifest.exists() || await manifest.length() > 16384)
         return null;
       final saved = xmlyMap(jsonDecode(await manifest.readAsString()));
@@ -604,7 +754,17 @@ class MediaProcessor {
     );
   }
 
-  static List<String> _metadata(
+  static String _escapeMetadata(String value) {
+    if (value.contains('\u0000')) {
+      throw const XmlyException('media_tags', '标签内容无效');
+    }
+    return value.replaceAllMapped(
+      RegExp(r'[\\=;#\r\n]'),
+      (match) => '\\${match[0]}',
+    );
+  }
+
+  static Map<String, String> _metadata(
     DownloadTask task,
     Map<String, dynamic> options,
     int? total,
@@ -636,12 +796,7 @@ class MediaProcessor {
     };
     final year = '${track.raw['year'] ?? ''}';
     if (RegExp(r'^[12][0-9]{3}$').hasMatch(year)) tags['date'] = year;
-    return [
-      for (final entry in tags.entries) ...[
-        '-metadata',
-        '${entry.key}=${entry.value}',
-      ],
-    ];
+    return tags;
   }
 
   static void _compatible(
@@ -668,9 +823,25 @@ class MediaProcessor {
     if (containers.intersection(expectedContainers).isEmpty) {
       throw const XmlyException('media_validation', '输出容器校验失败');
     }
+    // MP3 encoding may resample sources outside the encoder's supported rates.
+    // Original audio and other output formats still require the source rate.
+    final sampleRateCompatible =
+        source['sample_rate'] == result['sample_rate'] ||
+        (format == 'mp3' &&
+            const {
+              8000,
+              11025,
+              12000,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000,
+            }.contains(int.tryParse('${result['sample_rate']}')));
     if (result['codec_name'] != expected ||
         (before - after).abs() > math.max(2.0, before * .01) ||
-        source['sample_rate'] != result['sample_rate'] ||
+        !sampleRateCompatible ||
         source['channels'] != result['channels']) {
       throw const XmlyException('media_validation', '处理后的音轨、时长或声道校验失败');
     }
@@ -696,12 +867,12 @@ class MediaProcessor {
   static Future<String> _localFile(String value) async {
     if (!p.isAbsolute(value) ||
         value.contains('\u0000') ||
-        value.startsWith(r'\\') ||
-        value.startsWith('//') ||
         await FileSystemEntity.type(value, followLinks: false) !=
             FileSystemEntityType.file) {
       throw const XmlyException('media_local_file', '媒体处理只接受本地音频文件');
     }
+    // A Windows share or extended-length path is still a filesystem file.
+    // FFmpeg remains restricted to file/pipe protocols after canonicalization.
     return File(value).resolveSymbolicLinks();
   }
 
@@ -792,7 +963,7 @@ class MediaProcessor {
             account: '公共嵌入封面（无账号）',
             method: 'GET',
             url: '$uri',
-          )..responseByteCount = (() => bytes.length);
+          )..responseBytes = (() => bytes);
           await wait(_safeCoverUri(uri));
           response = null;
           final request = await wait(client.getUrl(uri));
@@ -821,7 +992,7 @@ class MediaProcessor {
             uri = uri.resolve(location);
             continue;
           }
-          const limit = 5 * 1024 * 1024;
+          const limit = _coverLimit;
           if (current.contentLength > limit) {
             definitive = true;
             diagnostic.completeness = '未读取响应体：Content-Length 超过 5 MiB 安全上限';

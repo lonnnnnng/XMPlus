@@ -19,10 +19,16 @@ import 'download_page.dart';
 import 'catalogue_page.dart';
 
 class ShellPage extends StatefulWidget {
-  const ShellPage({required this.appearance, required this.runtime, super.key});
+  const ShellPage({
+    required this.appearance,
+    required this.runtime,
+    this.onMiniPlayer,
+    super.key,
+  });
 
   final AppAppearance appearance;
   final AppRuntime runtime;
+  final VoidCallback? onMiniPlayer;
 
   @override
   State<ShellPage> createState() => _ShellPageState();
@@ -108,6 +114,21 @@ class _ShellPageState extends State<ShellPage> {
           appBar: AppBar(
             title: AdaptiveText(_destinations[_selectedIndex].label),
             actions: [
+              if (widget.onMiniPlayer != null)
+                PopupMenuButton<String>(
+                  tooltip: '窗口操作',
+                  onSelected: (value) {
+                    if (value == 'mini') {
+                      widget.onMiniPlayer!();
+                    } else {
+                      widget.runtime.requestExit?.call();
+                    }
+                  },
+                  itemBuilder: (_) => const [
+                    PopupMenuItem(value: 'mini', child: Text('收起到小窗')),
+                    PopupMenuItem(value: 'exit', child: Text('彻底退出')),
+                  ],
+                ),
               if (compact)
                 PopupMenuButton<String>(
                   tooltip: '更多操作',

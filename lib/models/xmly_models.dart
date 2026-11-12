@@ -20,10 +20,9 @@ String xmlyIdentifier(String value) {
 }
 
 int? xmlyPositive(Object? value) {
-  if (value is! String && value is! int) return null;
-  final text = value.toString();
-  if (!RegExp(r'^[0-9]+$').hasMatch(text)) return null;
-  final number = int.tryParse(text);
+  if (value is int) return value > 0 ? value : null;
+  if (value is! String || !RegExp(r'^[0-9]+$').hasMatch(value)) return null;
+  final number = int.tryParse(value);
   return number != null && number > 0 ? number : null;
 }
 

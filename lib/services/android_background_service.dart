@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
 import 'download_service.dart';
+import 'close_sequence.dart';
 
 /// Android only: exposes existing workers to the OS, without owning a queue.
 class AndroidBackgroundService with WidgetsBindingObserver {
@@ -40,7 +41,21 @@ class AndroidBackgroundService with WidgetsBindingObserver {
   StreamSubscription<void>? _subscription;
   Timer? _progressTimer;
   Future<void> _queue = Future<void>.value();
-  Future<void>? _closeFuture;
+  late final _closeSteps = CloseSequence([
+    () async {
+      _closed = true;
+      WidgetsBinding.instance.removeObserver(this);
+      _progressTimer?.cancel();
+    },
+    () async {
+      await _subscription?.cancel();
+    },
+    () => _queue,
+    () async {
+      _channel.setMethodCallHandler(null);
+    },
+    _stop,
+  ]);
   bool _closed = false, _queued = false, _started = false;
   bool _askedPermission = false, _permission = false;
   bool _failed = false, _timedOut = false;
@@ -250,15 +265,5 @@ class AndroidBackgroundService with WidgetsBindingObserver {
     _publishedState = null;
   }
 
-  Future<void> close() => _closeFuture ??= _close();
-
-  Future<void> _close() async {
-    _closed = true;
-    WidgetsBinding.instance.removeObserver(this);
-    _progressTimer?.cancel();
-    await _subscription?.cancel();
-    await _queue;
-    _channel.setMethodCallHandler(null);
-    await _stop();
-  }
+  Future<void> close() => _closeSteps.run();
 }

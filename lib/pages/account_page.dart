@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../api/xmly_login.dart';
 import '../common/widgets/adaptive_text.dart';
+import '../common/widgets/confirmation_dialog.dart';
 import '../api/xmly_rewards.dart';
 import '../models/xmly_models.dart';
 import '../services/account_service.dart';
@@ -41,9 +43,10 @@ String _accountError(Object error) {
     'uncertain' => '请求结果未知，请先在官方 App 核对，不要重复领取。',
     'reward_rejected' => '领取未成功，请在官方 App 检查。',
     'reward_paused' => '领取已暂停，请先在官方 App 核对，再选择恢复领取。',
-    'unsettled' => '还有未结算或结果未知的扣时，请先核对原账号。',
+    'unsettled' || 'usage_uncertain' => '还有未结算或结果未知的扣时，请先核对原账号。',
     'integration_required' => '暂时无法安全切换账号，原账号已保留。',
     'credential_write_failed' => '安全凭据保存失败，原账号已保留。',
+    'credential_mismatch' => '请导入该账号的 Cookie，并保留原设备 ID；其他账号不能恢复此记录。',
     'credential_read_failed' ||
     'credential_missing' ||
     'credential_invalid' => '无法读取登录信息，请重新导入原账号。',
@@ -57,37 +60,26 @@ Future<bool> _confirm(
   String title,
   String message, {
   String action = '确认',
-}) async =>
-    await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
-        content: SingleChildScrollView(child: Text(message)),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: Text(action),
-          ),
-        ],
-      ),
-    ) ==
-    true;
+}) => showConfirmationDialog(
+  context,
+  Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+  content: SingleChildScrollView(child: Text(message)),
+  confirmLabel: action,
+);
 
 class AccountPage extends StatefulWidget {
   const AccountPage({
     required this.storage,
     required this.accounts,
     this.onChanged,
+    this.updates,
     super.key,
   });
 
   final AppStorage storage;
   final AccountService accounts;
   final VoidCallback? onChanged;
+  final Listenable? updates;
 
   @override
   State<AccountPage> createState() => _AccountPageState();
@@ -97,12 +89,54 @@ class _AccountPageState extends State<AccountPage> {
   final _login = XmlyLogin();
   bool _busy = false;
   String? _error;
+  late String _viewKey;
 
   bool get _autoClaim =>
       (widget.storage.state['settings'] as Map)['autoClaim'] == true;
 
+  String _accountViewKey() {
+    final records = widget.storage.state['accounts'] as Map;
+    return jsonEncode([
+      widget.accounts.primaryAccountId,
+      widget.accounts.activeClient?.identity,
+      widget.accounts.accountIds,
+      _autoClaim,
+      for (final identity in widget.accounts.accountIds)
+        [
+          identity,
+          if (records[identity] case final Map record)
+            for (final field in ['uid', 'deviceHint', 'rewardPaused', 'quota'])
+              record[field],
+        ],
+    ]);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _viewKey = _accountViewKey();
+    widget.updates?.addListener(_changed);
+  }
+
+  @override
+  void didUpdateWidget(covariant AccountPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.updates != widget.updates) {
+      oldWidget.updates?.removeListener(_changed);
+      widget.updates?.addListener(_changed);
+    }
+    _viewKey = _accountViewKey();
+  }
+
+  void _changed() {
+    if (!mounted) return;
+    final key = _accountViewKey();
+    if (key != _viewKey) setState(() => _viewKey = key);
+  }
+
   @override
   void dispose() {
+    widget.updates?.removeListener(_changed);
     _login.close();
     super.dispose();
   }
@@ -123,11 +157,14 @@ class _AccountPageState extends State<AccountPage> {
     }
   }
 
-  Future<void> _openImport() async {
+  Future<void> _openImport({String? recoveryIdentity}) async {
     final changed = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (_) => _CredentialDialog(accounts: widget.accounts),
+      builder: (_) => _CredentialDialog(
+        accounts: widget.accounts,
+        recoveryIdentity: recoveryIdentity,
+      ),
     );
     if (!mounted || changed != true) return;
     widget.onChanged?.call();
@@ -256,6 +293,10 @@ class _AccountPageState extends State<AccountPage> {
         ? rawHint
         : '****';
     final primary = widget.accounts.primaryAccountId == identity;
+    final missing = widget.accounts.missingCredentialAccountIds.contains(
+      identity,
+    );
+    final active = widget.accounts.activeClient?.identity == identity;
     final paused = record['rewardPaused'] == true;
     final quota = record['quota'];
     Quota? verified;
@@ -286,61 +327,86 @@ class _AccountPageState extends State<AccountPage> {
                     padding: EdgeInsets.only(left: 8),
                     child: Chip(label: Text('主账号')),
                   ),
+                if (active && !primary)
+                  const Padding(
+                    padding: EdgeInsets.only(left: 8),
+                    child: Chip(label: Text('当前使用')),
+                  ),
               ],
             ),
             AdaptiveText('设备 $hint'),
             const SizedBox(height: 8),
-            Text(
-              remaining == null
-                  ? '可用听时：未核验'
-                  : '可用听时：${remaining ~/ 3600} 小时 ${(remaining % 3600) ~/ 60} 分 ${remaining % 60} 秒',
-            ),
-            if (checked != null)
-              AdaptiveText(
-                '核验于 ${checked.toString().split('.').first}',
-                style: Theme.of(context).textTheme.bodySmall,
+            if (missing) ...[
+              const Text('安全凭据缺失，请重新导入原账号。已有资料、下载和扣时记录均已保留。'),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: _busy
+                    ? null
+                    : () => _openImport(recoveryIdentity: identity),
+                icon: const Icon(Icons.key),
+                label: const Text('恢复此账号登录'),
               ),
-            if (paused)
-              const Padding(
-                padding: EdgeInsets.only(top: 8),
-                child: Text('领取已暂停，请先在官方 App 核对上一次结果。'),
+            ] else ...[
+              Text(
+                remaining == null
+                    ? '可用听时：未核验'
+                    : '可用听时：${remaining ~/ 3600} 小时 ${(remaining % 3600) ~/ 60} 分 ${remaining % 60} 秒',
               ),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                if (!primary)
-                  OutlinedButton(
+              if (checked != null)
+                AdaptiveText(
+                  '核验于 ${checked.toString().split('.').first}',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              if (paused)
+                const Padding(
+                  padding: EdgeInsets.only(top: 8),
+                  child: Text('领取已暂停，请先在官方 App 核对上一次结果。'),
+                ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  OutlinedButton.icon(
                     onPressed: _busy
                         ? null
-                        : () =>
-                              _run(() => widget.accounts.setPrimary(identity)),
-                    child: const Text('设为主账号'),
+                        : () => _openImport(recoveryIdentity: identity),
+                    icon: const Icon(Icons.key),
+                    label: const Text('更新登录'),
                   ),
-                OutlinedButton(
-                  onPressed: _busy ? null : () => _quota(identity),
-                  child: const Text('查询听时'),
-                ),
-                OutlinedButton(
-                  onPressed: _busy || paused
-                      ? null
-                      : () => _claim(identity, uid),
-                  child: const Text('领取一次'),
-                ),
-                if (paused)
+                  if (!primary || !active)
+                    OutlinedButton(
+                      onPressed: _busy
+                          ? null
+                          : () => _run(
+                              () => widget.accounts.setPrimary(identity),
+                            ),
+                      child: Text(primary ? '切回主账号' : '设为主账号'),
+                    ),
                   OutlinedButton(
-                    onPressed: _busy
-                        ? null
-                        : () => _resumeRewards(identity, uid),
-                    child: const Text('核对后恢复自动领取'),
+                    onPressed: _busy ? null : () => _quota(identity),
+                    child: const Text('查询听时'),
                   ),
-                TextButton(
-                  onPressed: _busy ? null : () => _remove(identity, uid),
-                  child: const Text('移除'),
-                ),
-              ],
-            ),
+                  OutlinedButton(
+                    onPressed: _busy || paused
+                        ? null
+                        : () => _claim(identity, uid),
+                    child: const Text('领取一次'),
+                  ),
+                  if (paused)
+                    OutlinedButton(
+                      onPressed: _busy
+                          ? null
+                          : () => _resumeRewards(identity, uid),
+                      child: const Text('核对后恢复自动领取'),
+                    ),
+                  TextButton(
+                    onPressed: _busy ? null : () => _remove(identity, uid),
+                    child: const Text('移除'),
+                  ),
+                ],
+              ),
+            ],
           ],
         ),
       ),
@@ -349,8 +415,12 @@ class _AccountPageState extends State<AccountPage> {
 
   @override
   Widget build(BuildContext context) {
+    _viewKey = _accountViewKey();
     final records = widget.storage.state['accounts'] as Map;
-    final ids = widget.accounts.accountIds;
+    final ids = [
+      ...widget.accounts.accountIds,
+      ...widget.accounts.missingCredentialAccountIds,
+    ];
     return PopScope(
       canPop: !_busy,
       child: Center(
@@ -424,8 +494,9 @@ class _AccountPageState extends State<AccountPage> {
 }
 
 class _CredentialDialog extends StatefulWidget {
-  const _CredentialDialog({required this.accounts});
+  const _CredentialDialog({required this.accounts, this.recoveryIdentity});
   final AccountService accounts;
+  final String? recoveryIdentity;
   @override
   State<_CredentialDialog> createState() => _CredentialDialogState();
 }
@@ -450,7 +521,11 @@ class _CredentialDialogState extends State<_CredentialDialog> {
     });
     try {
       final candidate = Credentials.parse(_cookie.text);
-      await widget.accounts.commit(candidate, makePrimary: _primary);
+      await widget.accounts.commit(
+        candidate,
+        makePrimary: _primary,
+        recoveryIdentity: widget.recoveryIdentity,
+      );
       if (mounted) Navigator.pop(context, true);
     } catch (error) {
       if (mounted) setState(() => _error = _accountError(error));
@@ -463,8 +538,8 @@ class _CredentialDialogState extends State<_CredentialDialog> {
   Widget build(BuildContext context) => PopScope(
     canPop: !_busy,
     child: AlertDialog(
-      title: const Text(
-        'Cookie 登录',
+      title: Text(
+        widget.recoveryIdentity == null ? 'Cookie 登录' : '恢复原账号登录',
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),
@@ -496,14 +571,20 @@ class _CredentialDialogState extends State<_CredentialDialog> {
                   border: OutlineInputBorder(),
                 ),
               ),
-              CheckboxListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('设为主账号'),
-                value: _primary,
-                onChanged: _busy
-                    ? null
-                    : (value) => setState(() => _primary = value!),
-              ),
+              if (widget.recoveryIdentity != null)
+                const Padding(
+                  padding: EdgeInsets.only(top: 12),
+                  child: Text('使用原账号和原设备 ID。恢复后保留主账号选择；结果未知的扣时仍需核对。'),
+                )
+              else
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('设为主账号'),
+                  value: _primary,
+                  onChanged: _busy
+                      ? null
+                      : (value) => setState(() => _primary = value!),
+                ),
               if (_error != null)
                 Text(
                   _error!,
@@ -548,6 +629,7 @@ class _SmsLoginDialogState extends State<_SmsLoginDialog> {
   Timer? _timer;
   Duration _resendAt = Duration.zero, _expiresAt = Duration.zero;
   String? _challenge, _error;
+  Credentials? _candidate;
   bool _busy = false, _committing = false, _primary = true, _cancelled = false;
 
   int get _cooldown => ((_resendAt - _watch.elapsed).inMilliseconds / 1000)
@@ -559,6 +641,7 @@ class _SmsLoginDialogState extends State<_SmsLoginDialog> {
     _cancelled = true;
     _login.clear();
     _challenge = null;
+    _candidate = null;
     _phone.clear();
     _code.clear();
   }
@@ -567,7 +650,7 @@ class _SmsLoginDialogState extends State<_SmsLoginDialog> {
   void initState() {
     super.initState();
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!mounted) return;
+      if (!mounted || _candidate != null) return;
       if (_challenge != null && _watch.elapsed >= _expiresAt && !_committing) {
         _login.clear();
         _challenge = null;
@@ -584,6 +667,7 @@ class _SmsLoginDialogState extends State<_SmsLoginDialog> {
     _login.clear();
     _watch.stop();
     _challenge = null;
+    _candidate = null;
     _phone.clear();
     _code.clear();
     _phone.dispose();
@@ -592,7 +676,7 @@ class _SmsLoginDialogState extends State<_SmsLoginDialog> {
   }
 
   Future<void> _send() async {
-    if (_busy || _cooldown > 0) return;
+    if (_busy || _cancelled || _candidate != null || _cooldown > 0) return;
     final mobile = _phone.text.trim();
     if (!RegExp(r'^\+?[0-9]{6,18}$').hasMatch(mobile)) {
       setState(() => _error = '请输入有效手机号（6–18 位数字，可含国际区号 +）。');
@@ -636,19 +720,25 @@ class _SmsLoginDialogState extends State<_SmsLoginDialog> {
 
   Future<void> _verify() async {
     final challenge = _challenge;
-    if (_busy || challenge == null) return;
+    if (_busy || _cancelled || (_candidate == null && challenge == null))
+      return;
     setState(() {
       _busy = true;
       _error = null;
     });
     try {
-      final candidate = await _login.verifySms(challenge, _code.text.trim());
-      if (!mounted || _cancelled) return;
-      _code.clear();
-      _phone.clear();
-      _challenge = null;
+      var candidate = _candidate;
+      if (candidate == null) {
+        candidate = await _login.verifySms(challenge!, _code.text.trim());
+        if (!mounted || _cancelled) return;
+        _candidate = candidate;
+        _code.clear();
+        _phone.clear();
+        _challenge = null;
+      }
       setState(() => _committing = true);
       await widget.accounts.commit(candidate, makePrimary: _primary);
+      _candidate = null;
       if (mounted) Navigator.pop(context, true);
     } catch (error) {
       if (mounted)
@@ -686,24 +776,28 @@ class _SmsLoginDialogState extends State<_SmsLoginDialog> {
             children: [
               const Text('先完成安全验证，再由你确认发送短信。登录后仍需核验极速版可用听时；失败不替换原账号。'),
               const SizedBox(height: 16),
-              TextField(
-                controller: _phone,
-                enabled: !_busy && _challenge == null,
-                autocorrect: false,
-                enableSuggestions: false,
-                enableIMEPersonalizedLearning: false,
-                keyboardType: TextInputType.phone,
-                inputFormatters: [LengthLimitingTextInputFormatter(19)],
-                decoration: const InputDecoration(
-                  labelText: '手机号',
-                  border: OutlineInputBorder(),
+              if (_candidate != null)
+                const Text('短信验证已完成，可直接重试登录，无需重新发送短信。')
+              else ...[
+                TextField(
+                  controller: _phone,
+                  enabled: !_busy && _challenge == null,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  enableIMEPersonalizedLearning: false,
+                  keyboardType: TextInputType.phone,
+                  inputFormatters: [LengthLimitingTextInputFormatter(19)],
+                  decoration: const InputDecoration(
+                    labelText: '手机号',
+                    border: OutlineInputBorder(),
+                  ),
                 ),
-              ),
-              const SizedBox(height: 12),
-              OutlinedButton(
-                onPressed: _busy || _cooldown > 0 ? null : _send,
-                child: Text(_cooldown > 0 ? '$_cooldown 秒后可重发' : '安全验证并发送短信'),
-              ),
+                const SizedBox(height: 12),
+                OutlinedButton(
+                  onPressed: _busy || _cooldown > 0 ? null : _send,
+                  child: Text(_cooldown > 0 ? '$_cooldown 秒后可重发' : '安全验证并发送短信'),
+                ),
+              ],
               if (_challenge != null) ...[
                 const SizedBox(height: 12),
                 TextField(
@@ -754,7 +848,9 @@ class _SmsLoginDialogState extends State<_SmsLoginDialog> {
           child: const Text('取消'),
         ),
         FilledButton(
-          onPressed: _busy || _challenge == null ? null : _verify,
+          onPressed: _busy || (_challenge == null && _candidate == null)
+              ? null
+              : _verify,
           child: const Text('验证并登录'),
         ),
       ],

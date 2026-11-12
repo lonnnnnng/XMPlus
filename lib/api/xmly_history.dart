@@ -98,12 +98,18 @@ class XmlyHistory {
     return data;
   }
 
-  Future<List<Map<String, dynamic>>> records() async {
+  Future<List<Map<String, dynamic>>> records() => _records();
+
+  Future<List<Map<String, dynamic>>> _records({
+    bool Function()? isActive,
+    void Function(Iterable<Map<String, dynamic>>)? onPage,
+  }) async {
     final context = _context();
     final identity = client.cacheIdentity;
     final items = <String, Map<String, dynamic>>{};
     final pages = <String>{};
     for (var page = 1; page <= 50; page++) {
+      if (isActive != null && !isActive()) return const [];
       final response = await client.request(
         'GET',
         XmlyClient.mobile,
@@ -116,6 +122,7 @@ class XmlyHistory {
           'uid': context['uid'],
         },
       );
+      if (isActive != null && !isActive()) return const [];
       if (identity != client.cacheIdentity) {
         throw XmlyException('account_changed', '查询期间账号已变更，请重试');
       }
@@ -138,6 +145,7 @@ class XmlyHistory {
           items[id] = item;
         }
       }
+      onPage?.call(items.values);
       if (!more) {
         return items.values.toList()..sort(
           (a, b) =>
@@ -165,16 +173,47 @@ class XmlyHistory {
   Future<Map<String, dynamic>?> progress({
     String albumId = '',
     String trackId = '',
+    Duration? timeout,
   }) async {
     final album = albumId.isEmpty ? '' : _id(albumId);
     final track = trackId.isEmpty ? '' : 'xmly:${_id(trackId)}';
     if (album.isEmpty && track.isEmpty) throw ArgumentError('请指定声音或专辑');
-    for (final item in await records()) {
-      if ((album.isEmpty || item['album_id'] == album) &&
-          (track.isEmpty || item['track_id'] == track))
-        return item;
+    if (timeout != null && timeout <= Duration.zero) {
+      throw ArgumentError('历史查询等待时间无效');
     }
-    return null;
+    var active = true;
+    Map<String, dynamic>? latest;
+    final scan = _records(
+      isActive: () => active,
+      onPage: (items) {
+        latest = null;
+        for (final item in items) {
+          if ((album.isEmpty || item['album_id'] == album) &&
+              (track.isEmpty || item['track_id'] == track) &&
+              (latest == null ||
+                  (item['updated_at'] as double) >
+                      (latest!['updated_at'] as double))) {
+            latest = item;
+          }
+        }
+      },
+    ).then((_) => latest);
+    try {
+      return await (timeout == null
+          ? scan
+          : scan.timeout(
+              timeout,
+              onTimeout: () {
+                if (latest == null) {
+                  throw const XmlyException('history_timeout', '云进度查询超时');
+                }
+                return {...latest!, 'incomplete': true};
+              },
+            ));
+    } finally {
+      // An in-flight page may finish later; do not fetch more or change playback.
+      active = false;
+    }
   }
 
   /// Explicit write only; retries reuse the same absolute history snapshot.

@@ -7,22 +7,24 @@ import 'package:flutter/foundation.dart';
 
 import '../models/xmly_models.dart';
 import 'album_cache.dart';
+import 'close_sequence.dart';
 import 'player_service.dart';
 import 'windows_audio_service.dart';
 
 /// A system-control view of PlayerService, never a second player or queue.
 class SystemMediaService extends BaseAudioHandler {
-  SystemMediaService._(this._player, this._albumCache);
+  SystemMediaService._(this._player, this._albumCache, this._commandsAllowed);
 
   static Future<SystemMediaService> start({
     required PlayerService player,
     required AlbumCache albumCache,
+    bool Function()? commandsAllowed,
   }) async {
-    if (!Platform.isAndroid && !Platform.isWindows && !Platform.isMacOS) {
-      throw UnsupportedError('当前平台暂不支持系统媒体控制');
+    if (!Platform.isAndroid && !Platform.isWindows) {
+      throw UnsupportedError('系统媒体控制仅支持 Android 和 Windows');
     }
     if (Platform.isWindows) WindowsAudioServicePlatform.registerWith();
-    final handler = SystemMediaService._(player, albumCache);
+    final handler = SystemMediaService._(player, albumCache, commandsAllowed);
     await AudioService.init<SystemMediaService>(
       builder: () => handler,
       config: const AudioServiceConfig(
@@ -44,15 +46,49 @@ class SystemMediaService extends BaseAudioHandler {
 
   final PlayerService _player;
   final AlbumCache _albumCache;
+  final bool Function()? _commandsAllowed;
   final Stopwatch _clock = Stopwatch()..start();
   final Set<Future<void>> _pending = {};
   StreamSubscription<void>? _playerEvents;
   StreamSubscription<Object>? _platformErrors;
-  Future<void>? _closeFuture;
+  late final _closeSteps = CloseSequence([
+    () async {
+      _closed = true;
+      _albumCache.removeListener(_sync);
+    },
+    () async {
+      await _playerEvents?.cancel();
+    },
+    () async {
+      await _platformErrors?.cancel();
+    },
+    () async {
+      await Future.wait(_pending.toList());
+    },
+    () async {
+      mediaItem.add(null);
+      playbackState.add(PlaybackState());
+      _clock.stop();
+    },
+    () async {
+      await Future.wait([
+        playbackState.close(),
+        mediaItem.close(),
+        queue.close(),
+        queueTitle.close(),
+        androidPlaybackInfo.close(),
+        ratingStyle.close(),
+        customEvent.close(),
+        customState.close(),
+      ]);
+    },
+    () => AudioServicePlatform.instance.stopService(const StopServiceRequest()),
+  ]);
   bool _closed = false, _dismissed = false, _everActive = false;
   Object? _metadataKey, _stateKey;
   String? _commandError, _nativeError;
   int _publishedAt = -1000;
+  int _commandRecoveryRevision = 0;
 
   static Duration _seconds(double seconds) => Duration(
     microseconds: (seconds * Duration.microsecondsPerSecond).round(),
@@ -87,8 +123,11 @@ class SystemMediaService extends BaseAudioHandler {
       _dismissed = false;
       _everActive = true;
     }
-    // long: 应用内重试不经过通知栏命令入口；恢复加载或播放后，旧命令错误应随之失效。
-    if (_player.error == null && (_player.loading || _player.playing)) {
+    if (_commandError != null &&
+        !_player.loading &&
+        hasSource &&
+        _player.error == null &&
+        _player.playbackRecoveryRevision != _commandRecoveryRevision) {
       _commandError = null;
     }
     final error = _nativeError ?? _commandError ?? _player.error;
@@ -204,6 +243,7 @@ class SystemMediaService extends BaseAudioHandler {
   }
 
   Future<void> _command(Future<void> Function() action) async {
+    if (!(_commandsAllowed?.call() ?? true)) return;
     if (_closed) throw StateError('系统媒体控制已关闭');
     final finished = Completer<void>();
     _pending.add(finished.future);
@@ -213,6 +253,7 @@ class SystemMediaService extends BaseAudioHandler {
     } catch (failure, stack) {
       if (!_closed) {
         _commandError = _player.error ?? '系统播放操作失败，请在应用内重试';
+        _commandRecoveryRevision = _player.playbackRecoveryRevision;
         _report(failure, stack, _commandError!);
       }
       rethrow;
@@ -265,34 +306,7 @@ class SystemMediaService extends BaseAudioHandler {
   Future<void> rewind() => _command(_player.seekBackward);
 
   /// The runtime quiesces PlayerService before closing this projection.
-  Future<void> close() => _closeFuture ??= _close();
-
-  Future<void> _close() async {
-    _closed = true;
-    _albumCache.removeListener(_sync);
-    await _playerEvents?.cancel();
-    await _platformErrors?.cancel();
-    await Future.wait(_pending.toList());
-    mediaItem.add(null);
-    playbackState.add(PlaybackState());
-    _clock.stop();
-    try {
-      await Future.wait([
-        playbackState.close(),
-        mediaItem.close(),
-        queue.close(),
-        queueTitle.close(),
-        androidPlaybackInfo.close(),
-        ratingStyle.close(),
-        customEvent.close(),
-        customState.close(),
-      ]);
-    } finally {
-      // Drain the plugin's state streams before the final awaited native stop,
-      // so an older queued playing state cannot reactivate the media session.
-      await AudioServicePlatform.instance.stopService(
-        const StopServiceRequest(),
-      );
-    }
-  }
+  // Drain state streams before the native stop. If it fails, retry only that
+  // stop; publishing to or closing the completed streams must not run again.
+  Future<void> close() => _closeSteps.run();
 }

@@ -18,6 +18,7 @@ import 'backup_page.dart';
 import 'download_settings_page.dart';
 import 'media_settings_page.dart';
 import 'playback_settings_page.dart';
+import 'window_close_preferences.dart';
 
 enum _SettingsSection {
   account,
@@ -89,6 +90,7 @@ class _SettingsPageState extends State<SettingsPage> {
       storage: widget.runtime.storage,
       accounts: widget.runtime.accounts,
       onChanged: widget.runtime.changed,
+      updates: widget.runtime,
     ),
     _SettingsSection.backup => BackupPage(
       storage: widget.runtime.storage,
@@ -312,6 +314,13 @@ class _AppearanceSettings extends StatelessWidget {
               ),
             ),
           ),
+          if (Platform.isWindows) ...[
+            const SizedBox(height: 16),
+            _SettingsCard(
+              title: '窗口',
+              child: WindowClosePreference(runtime: runtime),
+            ),
+          ],
         ],
       ),
     );
@@ -477,14 +486,14 @@ class _AboutSettings extends StatelessWidget {
                   leading: const Icon(Icons.code),
                   title: const Text('GitHub'),
                   subtitle: const SelectableText(
-                    'https://github.com/lonnnnnng/XMPlus',
+                    'https://github.com/teikengstudio/xmplus',
                   ),
                   trailing: IconButton(
                     tooltip: '打开 GitHub',
                     icon: const Icon(Icons.open_in_new),
                     onPressed: () => _openContact(
                       context,
-                      'https://github.com/lonnnnnng/XMPlus',
+                      'https://github.com/teikengstudio/xmplus',
                     ),
                   ),
                 ),

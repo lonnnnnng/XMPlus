@@ -11,6 +11,7 @@ import '../services/download_service.dart';
 import '../models/xmly_models.dart';
 import '../services/auto_download_service.dart';
 import '../services/android_platform.dart';
+import '../services/file_paths.dart';
 import 'catalogue_page.dart';
 
 Future<({String identity, bool polling})?> _chooseDownloadAccount(
@@ -130,11 +131,79 @@ Future<bool> deleteDownloadedAudio(
     ),
   );
   if (confirmed != true) return false;
-  await runtime.player.stopTaskReference(task.id);
-  final file = File(path);
-  if (await file.exists()) await file.delete();
-  await runtime.downloads.markAudioDeleted(task.id);
+  await _deleteAudioGroup(runtime, [task]);
   return true;
+}
+
+String _audioPathKey(String path) => Platform.isWindows
+    ? absoluteFilePath(path).toLowerCase()
+    : absoluteFilePath(path);
+
+Future<void> _deleteAudioGroup(
+  AppRuntime runtime,
+  List<DownloadTask> tasks, {
+  void Function(int bytes)? onDeleted,
+}) async {
+  final path = tasks.first.finalPath!;
+  final key = _audioPathKey(path);
+  final ids = tasks.map((task) => task.id).toSet();
+  void validate() {
+    for (final expected in tasks) {
+      final current = runtime.downloads.task(expected.id);
+      if (current.state != DownloadState.completed ||
+          current.finalPath != expected.finalPath ||
+          current.accountIdentity != expected.accountIdentity ||
+          current.track.id != expected.track.id) {
+        throw const XmlyException('download_changed', '下载记录已变化，请重新选择后删除');
+      }
+    }
+    if (runtime.downloads.tasks.any(
+      (task) =>
+          task.state == DownloadState.completed &&
+          task.finalPath != null &&
+          _audioPathKey(task.finalPath!) == key &&
+          !ids.contains(task.id),
+    )) {
+      throw const XmlyException('shared_audio', '其他下载记录也引用此文件，请一并选择后删除');
+    }
+  }
+
+  validate();
+  for (final task in tasks) {
+    await runtime.player.stopTaskReference(task.id);
+  }
+  validate();
+  final type = await FileSystemEntity.type(path, followLinks: false);
+  if (type == FileSystemEntityType.notFound) {
+    for (final task in tasks) {
+      await runtime.downloads.markAudioMissing(
+        task.id,
+        expectedPath: task.finalPath!,
+      );
+    }
+    return;
+  }
+  if (type != FileSystemEntityType.file) {
+    throw const XmlyException('audio_changed', '音频路径已不是普通文件，请检查下载目录');
+  }
+  final file = File(path);
+  final bytes = await file.length();
+  validate();
+  await file.delete();
+  onDeleted?.call(bytes);
+  for (final task in tasks) {
+    try {
+      await runtime.downloads.markAudioDeleted(
+        task.id,
+        expectedPath: task.finalPath,
+      );
+    } catch (_) {
+      throw const XmlyException(
+        'audio_record_update_failed',
+        '音频文件已删除，但记录更新未完成，请刷新后检查',
+      );
+    }
+  }
 }
 
 Future<void> setAlbumAutoDownload(
@@ -228,32 +297,32 @@ Future<bool> confirmDownloadBatch(
                   const SizedBox(height: 8),
                   const Text('逐集扣除整首时长，下载失败或取消不自动退回。原任务重试不会重复扣时。'),
                 ],
-                const SizedBox(height: 12),
-                ConstrainedBox(
-                  constraints: const BoxConstraints(maxHeight: 260),
-                  child: Scrollbar(
-                    child: ListView.builder(
-                      shrinkWrap: true,
-                      itemCount: batch.items.length,
-                      itemBuilder: (_, index) {
-                        final item = batch.items[index];
-                        return ListTile(
-                          dense: true,
-                          contentPadding: EdgeInsets.zero,
-                          title: Text(
-                            item.track.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                          subtitle: Text(
-                            item.error ??
-                                '${item.accountIdentity != batch.accountIdentity ? "已切换账号 · " : ""}${item.seconds} 秒',
-                          ),
-                        );
-                      },
+                if (batch.items.isNotEmpty) const SizedBox(height: 12),
+                if (batch.items.isNotEmpty)
+                  SizedBox(
+                    height: (batch.items.length * 72.0).clamp(72.0, 260.0),
+                    child: Scrollbar(
+                      child: ListView.builder(
+                        itemCount: batch.items.length,
+                        itemBuilder: (_, index) {
+                          final item = batch.items[index];
+                          return ListTile(
+                            dense: true,
+                            contentPadding: EdgeInsets.zero,
+                            title: Text(
+                              item.track.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            subtitle: Text(
+                              item.error ??
+                                  '${item.accountIdentity != batch.accountIdentity ? "已切换账号 · " : ""}${item.seconds} 秒',
+                            ),
+                          );
+                        },
+                      ),
                     ),
                   ),
-                ),
               ],
             ),
           ),
@@ -285,8 +354,15 @@ class _DownloadPageState extends State<DownloadPage> {
   String? _error;
   String? _availabilityKey;
   int _availabilityEpoch = 0;
+  bool _refreshingAvailability = false;
   Map<String, bool> _available = const {};
   final _expandedAlbums = <String>{};
+  final _selectedDownloads = <String>{};
+  bool _selectingDownloads = false, _deletingAudio = false;
+  int _deletionDone = 0, _deletionTotal = 0;
+  final _downloadQuery = TextEditingController();
+  Timer? _searchDebounce;
+  String _downloadFilter = '';
   StreamSubscription<void>? _taskChanges;
 
   @override
@@ -303,8 +379,15 @@ class _DownloadPageState extends State<DownloadPage> {
 
   void _tasksChanged() {
     if (!mounted) return;
-    setState(() {});
-    unawaited(_refreshAvailability(_service.tasks));
+    final tasks = _service.tasks;
+    setState(() {
+      if (_selectedDownloads.isNotEmpty) {
+        _selectedDownloads.retainAll(
+          tasks.where(_canSelectAudio).map((task) => task.id),
+        );
+      }
+    });
+    if (!_deletingAudio) unawaited(_refreshAvailability(tasks));
   }
 
   void _cacheChanged() {
@@ -320,11 +403,15 @@ class _DownloadPageState extends State<DownloadPage> {
     oldWidget.runtime.albumCache.removeListener(_cacheChanged);
     _availabilityKey = null;
     _available = const {};
+    _selectedDownloads.clear();
+    _selectingDownloads = false;
     _listen();
   }
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
+    _downloadQuery.dispose();
     unawaited(_taskChanges?.cancel());
     widget.runtime.albumCache.removeListener(_cacheChanged);
     super.dispose();
@@ -354,6 +441,17 @@ class _DownloadPageState extends State<DownloadPage> {
     }
   }
 
+  Future<void> _recheckAvailability() async {
+    if (_refreshingAvailability || _deletingAudio) return;
+    setState(() => _refreshingAvailability = true);
+    try {
+      _availabilityKey = null;
+      await _refreshAvailability(_service.tasks);
+    } finally {
+      if (mounted) setState(() => _refreshingAvailability = false);
+    }
+  }
+
   Future<void> _run(Future<void> Function() operation) async {
     try {
       await operation();
@@ -367,18 +465,23 @@ class _DownloadPageState extends State<DownloadPage> {
 
   Future<void> _retry(DownloadTask task) async {
     task = _service.task(task.id);
+    if (task.state == DownloadState.awaitingDebit && task.needsConfirmation) {
+      // Drain the worker that reported the changed fee before preparing again.
+      await widget.runtime.pauseDownload(task.id);
+      task = _service.task(task.id);
+    }
     if (task.state != DownloadState.failed &&
-        task.state != DownloadState.paused)
+        task.state != DownloadState.paused &&
+        task.state != DownloadState.cancelled)
       return;
     if (task.processingFailed) {
       await _service.retry(task.id);
       return;
     }
-    if (task.needsConfirmation) {
+    if (task.needsConfirmation || !task.userConfirmed) {
       final batch = await _service.prepareRetry(task.id);
       if (!mounted) return;
-      if (await confirmDownloadBatch(context, batch))
-        await _service.enqueue(batch, confirmed: true);
+      await _service.enqueue(batch, confirmed: true);
     } else {
       await _service.retry(task.id);
     }
@@ -628,9 +731,134 @@ class _DownloadPageState extends State<DownloadPage> {
   }
 
   Future<void> _delete(DownloadTask task) async {
-    if (await deleteDownloadedAudio(context, widget.runtime, task)) {
+    if (_deletingAudio) return;
+    setState(() => _deletingAudio = true);
+    try {
+      if (await deleteDownloadedAudio(context, widget.runtime, task)) {
+        _availabilityKey = null;
+        await _refreshAvailability(_service.tasks);
+      }
+    } finally {
+      if (mounted) setState(() => _deletingAudio = false);
+    }
+  }
+
+  bool _canSelectAudio(DownloadTask task) =>
+      task.state == DownloadState.completed && task.finalPath != null;
+
+  void _selectAudio(Iterable<DownloadTask> tasks) {
+    if (_deletingAudio) return;
+    final ids = tasks.where(_canSelectAudio).map((task) => task.id).toSet();
+    if (ids.isEmpty) return;
+    setState(() {
+      _selectingDownloads = true;
+      if (ids.every(_selectedDownloads.contains)) {
+        _selectedDownloads.removeAll(ids);
+      } else {
+        _selectedDownloads.addAll(ids);
+      }
+    });
+  }
+
+  Future<void> _deleteSelectedAudio() async {
+    if (_deletingAudio || _selectedDownloads.isEmpty) return;
+    final runtime = widget.runtime;
+    final groups = <String, List<DownloadTask>>{};
+    for (final task in _service.tasks.where(_canSelectAudio)) {
+      if (_selectedDownloads.contains(task.id)) {
+        groups.putIfAbsent(_audioPathKey(task.finalPath!), () => []).add(task);
+      }
+    }
+    if (groups.isEmpty) return;
+    setState(() {
+      _deletingAudio = true;
+      _deletionDone = 0;
+      _deletionTotal = 0;
+    });
+    try {
+      var estimatedBytes = 0, unknownSizes = 0;
+      for (final tasks in groups.values) {
+        try {
+          final stat = await File(tasks.first.finalPath!).stat();
+          if (stat.type == FileSystemEntityType.file) {
+            estimatedBytes += stat.size;
+          } else {
+            unknownSizes++;
+          }
+        } on FileSystemException {
+          unknownSizes++;
+        }
+      }
+      if (!mounted || widget.runtime != runtime) return;
+      final count = groups.values.fold<int>(
+        0,
+        (sum, tasks) => sum + tasks.length,
+      );
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          scrollable: true,
+          title: Text('删除 $count 条声音的音频？'),
+          content: Text(
+            '共 ${groups.length} 个路径，预计释放 ${_bytes(estimatedBytes)}'
+            '${unknownSizes > 0 ? "（另有 $unknownSizes 个路径大小未知或文件已缺失）" : ""}。\n\n'
+            '正在使用这些文件的播放会停止。任务和扣时记录保留；缺失文件不会记为主动删除。',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('删除所选音频'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted || widget.runtime != runtime) return;
+      setState(() => _deletionTotal = groups.length);
+      var freedBytes = 0, deletedFiles = 0;
+      final failures = <String>[];
+      final cleared = <String>{};
+      for (final tasks in groups.values) {
+        try {
+          await _deleteAudioGroup(
+            runtime,
+            tasks,
+            onDeleted: (bytes) {
+              freedBytes += bytes;
+              deletedFiles++;
+            },
+          );
+          cleared.addAll(tasks.map((task) => task.id));
+        } catch (error) {
+          failures.add(
+            '${tasks.first.track.title}：${error is XmlyException ? error.message : "删除或记录更新未完成，请刷新后重试"}',
+          );
+        }
+        if (mounted && widget.runtime == runtime)
+          setState(() => _deletionDone++);
+      }
+      if (!mounted || widget.runtime != runtime) return;
+      setState(() {
+        _selectedDownloads.removeAll(cleared);
+        if (_selectedDownloads.isEmpty) _selectingDownloads = false;
+        _error = failures.isEmpty
+            ? null
+            : '${failures.length} 个路径未完全处理；已删除文件不会恢复。\n${failures.take(3).join("\n")}';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '已删除 $deletedFiles 个文件，释放 ${_bytes(freedBytes)}；${failures.length} 项未完成',
+          ),
+        ),
+      );
       _availabilityKey = null;
       await _refreshAvailability(_service.tasks);
+    } finally {
+      if (mounted) setState(() => _deletingAudio = false);
     }
   }
 
@@ -660,19 +888,18 @@ class _DownloadPageState extends State<DownloadPage> {
     final cached = albumId.isEmpty ? null : widget.runtime.albumCache[albumId];
     final album = cached?.album;
     final total = album?.total ?? 0;
-    final completed = {
+    late final completed = {
       for (final task in tasks)
-        if (task.state == DownloadState.completed &&
-            _available[task.id] == true)
-          task.track.id,
+        if (_available[task.id] == true) task.track.id,
     }.length;
-    final missing = tasks
-        .where(
-          (task) =>
-              task.state == DownloadState.completed &&
-              (task.finalPath == null || _available[task.id] == false),
-        )
-        .length;
+    final missing = downloaded
+        ? tasks
+              .where(
+                (task) =>
+                    task.finalPath == null || _available[task.id] == false,
+              )
+              .length
+        : 0;
     final states = <DownloadState, int>{};
     for (final task in tasks) {
       states.update(task.state, (count) => count + 1, ifAbsent: () => 1);
@@ -690,6 +917,11 @@ class _DownloadPageState extends State<DownloadPage> {
         : '专辑 $albumId';
     final expansionKey = '${downloaded ? 'downloaded' : 'tasks'}:$albumId';
     final expanded = _expandedAlbums.contains(expansionKey);
+    late final selectable = tasks.where(_canSelectAudio).toList();
+    late final selected = selectable
+        .where((task) => _selectedDownloads.contains(task.id))
+        .length;
+    final selecting = downloaded && _selectingDownloads;
     void toggle() => setState(() {
       if (expanded) {
         _expandedAlbums.remove(expansionKey);
@@ -706,7 +938,19 @@ class _DownloadPageState extends State<DownloadPage> {
               horizontal: compact ? 8 : 16,
               vertical: 6,
             ),
-            leading: compact
+            leading: selecting
+                ? Checkbox(
+                    tristate: true,
+                    value: selected == 0
+                        ? false
+                        : selected == selectable.length
+                        ? true
+                        : null,
+                    onChanged: _deletingAudio || selectable.isEmpty
+                        ? null
+                        : (_) => _selectAudio(selectable),
+                  )
+                : compact
                 ? null
                 : CoverImage(
                     uri: album?.coverUrl ?? tasks.first.track.coverUrl,
@@ -745,9 +989,14 @@ class _DownloadPageState extends State<DownloadPage> {
                 ),
               ],
             ),
-            onTap: albumId.isEmpty
+            onTap: selecting
+                ? (_deletingAudio ? null : () => _selectAudio(selectable))
+                : albumId.isEmpty
                 ? toggle
                 : () => _run(() => _openAlbum(albumId)),
+            onLongPress: downloaded && !_deletingAudio
+                ? () => _selectAudio(selectable)
+                : null,
             trailing: IconButton(
               tooltip: expanded ? '收起声音与操作' : '展开声音与操作',
               icon: Icon(expanded ? Icons.expand_less : Icons.expand_more),
@@ -774,33 +1023,65 @@ class _DownloadPageState extends State<DownloadPage> {
     );
   }
 
-  Widget _downloadedTrack(DownloadTask task, bool compact) {
+  Widget _downloadedTrack(
+    DownloadTask task,
+    bool compact, {
+    bool searchResult = false,
+  }) {
     final available = _available[task.id] == true;
     return ListTile(
-      leading: compact
+      selected: _selectingDownloads && _selectedDownloads.contains(task.id),
+      leading: _selectingDownloads
+          ? Checkbox(
+              value: _selectedDownloads.contains(task.id),
+              onChanged: _deletingAudio || !_canSelectAudio(task)
+                  ? null
+                  : (_) => _selectAudio([task]),
+            )
+          : compact
           ? null
           : CoverImage(
-              uri: task.track.coverUrl,
-              localPath:
-                  widget.runtime.albumCache[task.track.albumId]?.coverPath,
+              uri: searchResult ? null : task.track.coverUrl,
+              localPath: task.track.albumId.isEmpty
+                  ? null
+                  : widget.runtime.albumCache[task.track.albumId]?.coverPath,
               downloaded: available,
               size: 44,
             ),
       title: AdaptiveText(task.track.title),
-      subtitle: Text(
-        _available.containsKey(task.id)
-            ? (available ? '已下载' : '音频文件已不存在')
-            : '正在检查本地文件',
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (searchResult)
+            Text(
+              _downloadAlbumTitle(task),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          Text(
+            _available.containsKey(task.id)
+                ? (available ? '已下载' : '音频文件已不存在')
+                : '正在检查本地文件',
+          ),
+        ],
       ),
-      onTap: available
+      onLongPress: _deletingAudio ? null : () => _selectAudio([task]),
+      onTap: _deletingAudio
+          ? null
+          : _selectingDownloads
+          ? () => _selectAudio([task])
+          : available
           ? () => _run(() => widget.runtime.player.playLocal(task.id))
           : null,
       trailing: PopupMenuButton<String>(
+        enabled: !_deletingAudio && !_selectingDownloads,
         tooltip: '已下载声音操作',
         onSelected: (action) => _run(() async {
           switch (action) {
             case 'play':
               await widget.runtime.player.playLocal(task.id);
+            case 'next':
+              await widget.runtime.player.playNext(task.track);
             case 'open':
               await _open(task);
             case 'delete':
@@ -809,6 +1090,8 @@ class _DownloadPageState extends State<DownloadPage> {
         }),
         itemBuilder: (_) => [
           if (available) const PopupMenuItem(value: 'play', child: Text('播放')),
+          if (available)
+            const PopupMenuItem(value: 'next', child: Text('下一集播放')),
           const PopupMenuItem(value: 'open', child: Text('打开目录')),
           if (available)
             const PopupMenuItem(value: 'delete', child: Text('删除音频')),
@@ -838,19 +1121,221 @@ class _DownloadPageState extends State<DownloadPage> {
     if (confirmed == true) await _service.cancelAlbum(id);
   }
 
-  Widget _albumList({required bool downloaded}) {
+  String _downloadAlbumTitle(DownloadTask task) {
+    final id = task.track.albumId;
+    final cached = id.isEmpty
+        ? null
+        : widget.runtime.albumCache[id]?.album.title;
+    if (cached != null && cached.isNotEmpty) return cached;
+    if (task.track.album.isNotEmpty) return task.track.album;
+    return id.isEmpty ? '未归属专辑的声音' : '专辑 $id';
+  }
+
+  void _searchDownloads(String text, {bool immediately = false}) {
+    _searchDebounce?.cancel();
+    void apply() {
+      if (mounted) setState(() => _downloadFilter = text.trim().toLowerCase());
+    }
+
+    if (immediately) {
+      apply();
+    } else {
+      _searchDebounce = Timer(const Duration(milliseconds: 180), apply);
+    }
+  }
+
+  Widget _downloadedLibrary(List<DownloadTask> completed) {
+    final compact = MediaQuery.sizeOf(context).width < 320;
+    final query = _downloadFilter;
+    final tokens = query
+        .split(RegExp(r'\s+'))
+        .where((value) => value.isNotEmpty);
+    final matches = query.isEmpty
+        ? const <DownloadTask>[]
+        : completed.where((task) {
+            final track = task.track;
+            final text = [
+              _downloadAlbumTitle(task),
+              track.album,
+              track.title,
+              for (final ordinal in {
+                track.officialPosition,
+                track.orderNo,
+                track.episode,
+              }.whereType<int>())
+                '$ordinal 第${ordinal}集',
+            ].join(' ').toLowerCase();
+            return tokens.every(text.contains);
+          }).toList();
+    return Column(
+      children: [
+        Padding(
+          padding: EdgeInsets.fromLTRB(
+            compact ? 8 : 16,
+            12,
+            compact ? 8 : 16,
+            8,
+          ),
+          child: TextField(
+            key: const ValueKey('downloadLibrarySearch'),
+            controller: _downloadQuery,
+            decoration: InputDecoration(
+              labelText: '搜索已下载',
+              hintText: '专辑、单集标题或集号',
+              prefixIcon: const Icon(Icons.search),
+              suffixIcon: ValueListenableBuilder<TextEditingValue>(
+                valueListenable: _downloadQuery,
+                builder: (context, value, _) => value.text.isEmpty
+                    ? const SizedBox.shrink()
+                    : IconButton(
+                        tooltip: '清除本地搜索',
+                        icon: const Icon(Icons.clear),
+                        onPressed: () {
+                          _downloadQuery.clear();
+                          _searchDownloads('', immediately: true);
+                        },
+                      ),
+              ),
+            ),
+            textInputAction: TextInputAction.search,
+            onChanged: _searchDownloads,
+            onSubmitted: (text) => _searchDownloads(text, immediately: true),
+          ),
+        ),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            OutlinedButton.icon(
+              onPressed:
+                  _refreshingAvailability || _deletingAudio || completed.isEmpty
+                  ? null
+                  : () => _run(_recheckAvailability),
+              icon: _refreshingAvailability
+                  ? const SizedBox.square(
+                      dimension: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.refresh),
+              label: Text(_refreshingAvailability ? '正在检查' : '刷新本地文件'),
+            ),
+            if (!_selectingDownloads)
+              OutlinedButton.icon(
+                onPressed: _deletingAudio || completed.isEmpty
+                    ? null
+                    : () => setState(() => _selectingDownloads = true),
+                icon: const Icon(Icons.checklist),
+                label: const Text('多选音频'),
+              )
+            else ...[
+              Text('已选 ${_selectedDownloads.length} 条'),
+              TextButton(
+                onPressed: _deletingAudio
+                    ? null
+                    : () => _selectAudio(completed),
+                child: const Text('全选／取消全选'),
+              ),
+              FilledButton.icon(
+                onPressed: _deletingAudio || _selectedDownloads.isEmpty
+                    ? null
+                    : () => _run(_deleteSelectedAudio),
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('删除所选音频'),
+              ),
+              TextButton(
+                onPressed: _deletingAudio
+                    ? null
+                    : () => setState(() {
+                        _selectingDownloads = false;
+                        _selectedDownloads.clear();
+                      }),
+                child: const Text('取消多选'),
+              ),
+            ],
+          ],
+        ),
+        if (_deletingAudio) ...[
+          LinearProgressIndicator(
+            value: _deletionTotal == 0 ? null : _deletionDone / _deletionTotal,
+          ),
+          Text(
+            _deletionTotal == 0
+                ? '正在准备删除'
+                : '正在处理 $_deletionDone / $_deletionTotal 个路径',
+          ),
+        ],
+        if (query.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Text(
+              '本地下载记录：匹配 ${matches.length} / 共 ${completed.length} 条',
+            ),
+          ),
+        if (query.isNotEmpty && _error != null)
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Text(
+              _error!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          ),
+        Expanded(
+          child: query.isEmpty
+              ? _albumList(completed, downloaded: true)
+              : matches.isEmpty
+              ? const Center(child: Text('未找到匹配的本地下载记录'))
+              : Scrollbar(
+                  child: ListView.builder(
+                    key: ValueKey('downloadSearch:$query'),
+                    itemCount: matches.length,
+                    itemBuilder: (context, index) => _downloadedTrack(
+                      matches[index],
+                      compact,
+                      searchResult: true,
+                    ),
+                  ),
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _albumList(Iterable<DownloadTask> tasks, {required bool downloaded}) {
     final compact = MediaQuery.sizeOf(context).width < 320;
     final groups = <String, List<DownloadTask>>{};
-    for (final task in _service.tasks) {
-      if ((task.state == DownloadState.completed) != downloaded ||
-          task.state == DownloadState.cancelled)
-        continue;
+    for (final task in tasks) {
       groups.putIfAbsent(task.track.albumId, () => []).add(task);
     }
+    if (downloaded) {
+      for (final group in groups.entries) {
+        if (group.key.isEmpty) continue;
+        final originalOrder = {
+          for (var index = 0; index < group.value.length; index++)
+            group.value[index].id: index,
+        };
+        int? position(DownloadTask task) =>
+            task.track.officialPosition ??
+            xmlyPositive(task.track.orderNo) ??
+            xmlyPositive(task.track.episode);
+        group.value.sort((a, b) {
+          final left = position(a), right = position(b);
+          if (left != null && right != null && left != right) {
+            return left.compareTo(right);
+          }
+          if ((left == null) != (right == null)) return left == null ? 1 : -1;
+          return originalOrder[a.id]!.compareTo(originalOrder[b.id]!);
+        });
+      }
+    }
     final albums = groups.entries.toList();
-    final jobs = _service.albumJobs
-        .where((job) => job.state != 'completed' && job.state != 'cancelled')
-        .toList();
+    final jobs = downloaded
+        ? const <DownloadAlbumJob>[]
+        : _service.albumJobs
+              .where(
+                (job) => job.state != 'completed' && job.state != 'cancelled',
+              )
+              .toList();
     return Scrollbar(
       child: ListView.builder(
         key: PageStorageKey(
@@ -919,6 +1404,14 @@ class _DownloadPageState extends State<DownloadPage> {
                                       job.state == 'failed' ? '重试专辑' : '继续专辑',
                                     ),
                                   ),
+                                if (job.state == 'failed' ||
+                                    job.state == 'paused')
+                                  TextButton(
+                                    onPressed: () => _run(
+                                      () => _service.refreshAlbum(job.id),
+                                    ),
+                                    child: const Text('刷新目录并继续'),
+                                  ),
                                 TextButton(
                                   onPressed: () =>
                                       _run(() => _cancelAlbum(job.id)),
@@ -962,32 +1455,43 @@ class _DownloadPageState extends State<DownloadPage> {
   @override
   Widget build(BuildContext context) => StreamBuilder<void>(
     stream: _autoDownloads.changes,
-    builder: (context, _) => DefaultTabController(
-      length: 2,
-      child: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 720),
-          child: Column(
-            children: [
-              const TabBar(
-                tabs: [
-                  Tab(text: '下载任务'),
-                  Tab(text: '已下载'),
-                ],
-              ),
-              Expanded(
-                child: TabBarView(
-                  children: [
-                    _albumList(downloaded: false),
-                    _albumList(downloaded: true),
+    builder: (context, _) {
+      final tasks = _service.tasks;
+      final completed = tasks
+          .where((task) => task.state == DownloadState.completed)
+          .toList();
+      return DefaultTabController(
+        length: 2,
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 720),
+            child: Column(
+              children: [
+                const TabBar(
+                  tabs: [
+                    Tab(text: '下载任务'),
+                    Tab(text: '已下载'),
                   ],
                 ),
-              ),
-            ],
+                Expanded(
+                  child: TabBarView(
+                    children: [
+                      _albumList(
+                        tasks.where(
+                          (task) => task.state != DownloadState.completed,
+                        ),
+                        downloaded: false,
+                      ),
+                      _downloadedLibrary(completed),
+                    ],
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
-      ),
-    ),
+      );
+    },
   );
 
   Widget _taskCard(DownloadTask task, bool compact) {
@@ -1051,7 +1555,15 @@ class _DownloadPageState extends State<DownloadPage> {
               spacing: 8,
               runSpacing: 8,
               children: [
-                if (task.active)
+                if (task.state == DownloadState.awaitingDebit &&
+                    task.needsConfirmation)
+                  TextButton(
+                    onPressed: () => _run(() => _retry(task)),
+                    child: const Text('重新获取'),
+                  ),
+                if (task.active &&
+                    !(task.state == DownloadState.awaitingDebit &&
+                        task.needsConfirmation))
                   TextButton(
                     onPressed: () =>
                         _run(() => widget.runtime.pauseDownload(task.id)),
@@ -1062,7 +1574,7 @@ class _DownloadPageState extends State<DownloadPage> {
                     onPressed: () => _run(() => _retry(task)),
                     child: Text(
                       task.needsConfirmation && !task.processingFailed
-                          ? '重新确认'
+                          ? '重新获取'
                           : '继续',
                     ),
                   ),
@@ -1071,11 +1583,16 @@ class _DownloadPageState extends State<DownloadPage> {
                     onPressed: () => _run(() => _retry(task)),
                     child: Text(
                       task.needsConfirmation
-                          ? '重新确认'
+                          ? '重新获取'
                           : task.processingFailed
                           ? '重试处理'
                           : '重试',
                     ),
+                  ),
+                if (task.state == DownloadState.cancelled)
+                  TextButton(
+                    onPressed: () => _run(() => _retry(task)),
+                    child: Text(task.processingFailed ? '恢复并重试处理' : '恢复任务'),
                   ),
                 if (task.processingFailed &&
                     (task.state == DownloadState.failed ||

@@ -13,6 +13,7 @@ import 'account_service.dart';
 import 'usage_ledger.dart';
 import 'download_paths.dart';
 import 'media_processor.dart';
+import 'file_paths.dart';
 
 export '../models/download_task.dart';
 
@@ -38,15 +39,17 @@ class DownloadControl {
   final void Function(int, int?, double) _progress;
   final Future<void> Function() _processing;
   final Future<void> Function(String) _warning;
-  Future<void> warning(String message) async {
-    await checkpoint();
-    await _warning(message);
-  }
+  // Processing warnings describe an already committed output. Persisting them
+  // must not discard that output when a stop arrives after the commit.
+  Future<void> warning(String message) => _warning(message);
 
   final Completer<void> _stopped = Completer<void>();
   bool _paused = false, _cancelled = false;
   bool get paused => _paused;
   bool get cancelled => _cancelled;
+
+  /// Allows backends to interrupt waits that do not reach a checkpoint.
+  Future<void> get stopped => _stopped.future;
   Future<void> checkpoint() async {
     if (_paused || _cancelled) throw const DownloadStopped();
   }
@@ -172,7 +175,7 @@ class DownloadAlbumJob {
     albumId: value['albumId'] as String,
     title: value['title'] as String,
     accountIdentity: value['accountIdentity'] as String,
-    rootDirectory: value['rootDirectory'] as String,
+    rootDirectory: absoluteFilePath(value['rootDirectory'] as String),
     settings: Map<String, dynamic>.from(value['settings'] as Map),
     total: value['total'] as int,
     page: value['page'] as int,
@@ -207,16 +210,21 @@ class DownloadService {
   final Map<String, DownloadAlbumJob> _albums = {};
   final Set<String> _albumWorkers = {};
   List<DownloadAlbumJob> get albumJobs => List.unmodifiable(_albums.values);
+  // Continue commands must observe the final snapshot after stopped workers drain.
+  final Lock _queueCommands = Lock();
   final Lock _updates = Lock();
   final Map<String, Lock> _admissionOrder = {};
   final StreamController<void> _changes = StreamController<void>.broadcast();
   final Map<String, DownloadTask> _tasks = {};
   final Map<String, ({DownloadControl control, Future<void> done})> _workers =
       {};
-  final Set<String> _stopping = {};
+  final Map<String, int> _stopping = {};
+  final Map<String, int> _stoppingAlbums = {};
   final Map<String, bool Function()> _automaticGuards = {};
+  final Map<String, Completer<void>> _albumStops = {};
+  final Set<String> _albumRechecks = {};
+  final Set<String> _freshResolves = {};
   bool _loaded = false, _closed = false, _suspended = false;
-  int _parallelism = 3;
   String? _priority;
 
   Stream<void> get changes => _changes.stream;
@@ -237,6 +245,9 @@ class DownloadService {
             restored.containsKey(item.id)) {
           throw const FormatException();
         }
+        item = item.copyWith(
+          rootDirectory: absoluteFilePath(item.rootDirectory),
+        );
         if (item.active) {
           item = item.copyWith(
             state: DownloadState.paused,
@@ -264,13 +275,7 @@ class DownloadService {
     }
     await _save(restored);
     _tasks.addAll(restored);
-    _parallelism = _option(
-      storage.state['settings'] as Map,
-      'parallelism',
-      3,
-      1,
-      6,
-    );
+    _option(storage.state['settings'] as Map, 'parallelism', 3, 1, 6);
     _loaded = true;
     _notify();
     // Restoring never schedules, resolves, claims, or debits.
@@ -316,6 +321,8 @@ class DownloadService {
     required String rootDirectory,
     required Map<String, dynamic> settings,
     bool previewBilling = true,
+    Future<void>? cancelled,
+    Future<void> Function()? checkpoint,
   }) async {
     _ensureOpen();
     await _reconcileOutputs(tracks.map((track) => track.id).toSet());
@@ -328,7 +335,7 @@ class DownloadService {
       id: 'preview',
       accountIdentity: accountIdentity,
       track: Track(id: '1'),
-      rootDirectory: rootDirectory,
+      rootDirectory: absoluteFilePath(rootDirectory),
       settings: settings,
       createdAt: DateTime.now(),
     ).settings;
@@ -363,6 +370,8 @@ class DownloadService {
           .map((entry) => (track: entry.track, taskId: entry.taskId))
           .toList(),
       previewBilling: previewBilling,
+      cancelled: cancelled,
+      checkpoint: checkpoint,
     );
   }
 
@@ -381,7 +390,7 @@ class DownloadService {
       id: 'preview',
       accountIdentity: accountIdentity,
       track: Track(id: '1'),
-      rootDirectory: rootDirectory,
+      rootDirectory: absoluteFilePath(rootDirectory),
       settings: settings,
       createdAt: DateTime.now(),
     ).settings;
@@ -390,7 +399,7 @@ class DownloadService {
       albumId: albumId,
       title: first.album.title,
       accountIdentity: accountIdentity,
-      rootDirectory: rootDirectory,
+      rootDirectory: absoluteFilePath(rootDirectory),
       settings: snapshot,
       total: first.total,
       seen: first.tracks.map((track) => track.id).toList(),
@@ -416,28 +425,47 @@ class DownloadService {
     int page, {
     int? total,
     List<String> seen = const [],
+    Future<void>? cancelled,
+    Future<void> Function()? checkpoint,
   }) async {
     Object? failure;
     for (final candidate in _candidates(identity, settings)) {
       try {
-        Future<AlbumPage> read(XmlyClient client) => client.album(
-          albumId,
-          page: page,
-          pageSize: xmlyAlbumPageSize,
-          ascending: true,
+        Future<AlbumPage> read(XmlyClient client) => readRequests(
+          client,
+          settings,
+          () => client.album(
+            albumId,
+            page: page,
+            pageSize: xmlyAlbumPageSize,
+            ascending: true,
+          ),
+          cancelled: cancelled,
+          checkpoint: checkpoint,
         );
         final result = candidate == 'anonymous'
             ? await read(anonymous)
-            : await accounts.runWithAccount(candidate, read);
+            : await _previewAccount(
+                candidate,
+                read,
+                null,
+                cancelled: cancelled,
+                checkpoint: checkpoint,
+              );
         final offset = (page - 1) * xmlyAlbumPageSize;
-        if (result.total > 5000 ||
-            result.total < 0 ||
-            total != null && result.total != total ||
+        if (result.total > 5000) {
+          throw const XmlyException('catalogue_limit', '专辑超过 5000 集下载上限');
+        }
+        if (total != null && result.total != total) {
+          throw const XmlyException('catalogue_changed', '专辑总集数已变化');
+        }
+        if (result.total < 0 ||
             result.page != page ||
+            result.pageSize != xmlyAlbumPageSize ||
             result.album.id != albumId ||
             result.tracks.length !=
                 (result.total - offset).clamp(0, xmlyAlbumPageSize)) {
-          throw const XmlyException('catalogue_changed', '专辑分页不完整或内容已变化');
+          throw const XmlyException('invalid_catalogue', '专辑分页不完整或无效');
         }
         final ids = seen.toSet();
         for (var index = 0; index < result.tracks.length; index++) {
@@ -457,56 +485,39 @@ class DownloadService {
     throw failure!;
   }
 
-  Future<void> pauseAlbum(String id) async {
-    final job = _albums[id]!;
-    job.state = 'paused';
-    await _updates.synchronized(() => _save(_tasks));
-    for (final taskId in job.taskIds) {
-      if (task(taskId).active) await pause(taskId);
-    }
-    _notify();
-  }
+  Future<void> pauseAlbum(String id) =>
+      _stopTasks(_albums[id]!.taskIds, cancel: false, albumId: id);
 
-  Future<void> cancelAlbum(String id) async {
-    final job = _albums[id]!;
-    job.state = 'cancelled';
-    await _updates.synchronized(() => _save(_tasks));
-    for (final taskId in job.taskIds) {
-      if (task(taskId).state != DownloadState.completed) await cancel(taskId);
-    }
-    _notify();
-  }
+  Future<void> cancelAlbum(String id) =>
+      _stopTasks(_albums[id]!.taskIds, cancel: true, albumId: id);
 
-  Future<void> resumeAlbum(String id) async {
+  Future<void> resumeAlbum(String id) => _queueCommands.synchronized(() async {
     _ensureOpen();
     final job = _albums[id]!;
     if (job.state == 'completed' || job.state == 'cancelled') return;
+    _albumRechecks.add(id);
     job.state = 'running';
     job.error = null;
     await _updates.synchronized(() => _save(_tasks));
     for (final taskId in job.taskIds) {
       final item = task(taskId);
       if (item.state == DownloadState.paused && !item.needsConfirmation)
-        await resume(taskId);
+        await _resume(taskId);
     }
     _suspended = false;
     _notify();
     _pump();
-  }
+  });
 
   void _pumpAlbums() {
     for (final job in _albums.values.toList()) {
       if (job.state != 'running' ||
+          _stoppingAlbums.containsKey(job.id) ||
           _albumWorkers.contains(job.id) ||
           job.taskIds.any(
             (id) =>
                 _workers.containsKey(id) ||
-                !const {
-                      DownloadState.completed,
-                      DownloadState.failed,
-                      DownloadState.cancelled,
-                    }.contains(task(id).state) &&
-                    !task(id).needsConfirmation,
+                task(id).active && !task(id).needsConfirmation,
           ))
         continue;
       _albumWorkers.add(job.id);
@@ -520,44 +531,69 @@ class DownloadService {
   }
 
   Future<void> _advanceAlbum(DownloadAlbumJob job) async {
+    final stop = Completer<void>();
+    _albumStops[job.id] = stop;
     bool allowed() =>
-        !_closed && !_suspended && _albums[job.id]?.state == 'running';
+        !_closed &&
+        !_suspended &&
+        !stop.isCompleted &&
+        !_stoppingAlbums.containsKey(job.id) &&
+        _albums[job.id]?.state == 'running';
+    Future<void> checkpoint() async {
+      if (!allowed()) throw const DownloadStopped();
+    }
+
     try {
+      if (_albumRechecks.remove(job.id)) {
+        await _refreshAlbum(job, stop.future, checkpoint, allowed);
+        return;
+      }
       if (job.page * xmlyAlbumPageSize >= job.total) {
         job.state = 'completed';
         await _updates.synchronized(() => _save(_tasks));
+        for (final id in job.taskIds) {
+          _automaticGuards.remove(id);
+        }
         _notify();
         return;
       }
-      final page = await _albumPage(
-        job.accountIdentity,
-        job.settings,
-        job.albumId,
-        job.page + 1,
-        total: job.total,
-        seen: job.seen,
-      );
-      if (!allowed()) return;
+      AlbumPage page;
+      try {
+        page = await _albumPage(
+          job.accountIdentity,
+          job.settings,
+          job.albumId,
+          job.page + 1,
+          total: job.total,
+          seen: job.seen,
+          cancelled: stop.future,
+          checkpoint: checkpoint,
+        );
+      } on XmlyException catch (error) {
+        if (!const {
+          'catalogue_changed',
+          'invalid_catalogue',
+        }.contains(error.code))
+          rethrow;
+        await checkpoint();
+        await _refreshAlbum(job, stop.future, checkpoint, allowed);
+        return;
+      }
+      await checkpoint();
       await _reconcileOutputs(page.tracks.map((track) => track.id).toSet());
       final next = DownloadAlbumJob.fromJson(job.toJson())
         ..page = job.page + 1
         ..seen = [...job.seen, ...page.tracks.map((track) => track.id)];
-      final batch = await _preview(
-        job.accountIdentity,
-        job.rootDirectory,
-        job.settings,
-        [
-          for (final track in page.tracks)
-            if (!_duplicate(job.accountIdentity, track.id))
-              (track: track, taskId: _missingTask(track.id)?.id),
-        ],
-        album: next,
-        previewBilling: job.settings['billingPreviewPending'] != true,
+      await _admitAlbumPage(
+        job,
+        next,
+        page.tracks,
+        stop.future,
+        checkpoint,
+        allowed,
       );
-      if (!allowed()) return;
-      await _enqueue(batch, confirmed: true, allowed: allowed);
     } on DownloadStopped {
-      // The cursor remains on the previous durable page.
+      // No cursor is committed after this generation is stopped.
     } catch (error) {
       if (!allowed()) return;
       job.state = 'failed';
@@ -566,7 +602,94 @@ class DownloadService {
         await _updates.synchronized(() => _save(_tasks));
       } catch (_) {}
       _notify();
+    } finally {
+      if (identical(_albumStops[job.id], stop)) _albumStops.remove(job.id);
     }
+  }
+
+  Future<void> _refreshAlbum(
+    DownloadAlbumJob job,
+    Future<void> cancelled,
+    Future<void> Function() checkpoint,
+    bool Function() allowed,
+  ) async {
+    // Read one complete strict snapshot before admitting anything. A second
+    // change during this bounded pass stops visibly rather than looping.
+    final tracks = <Track>[];
+    final first = await _albumPage(
+      job.accountIdentity,
+      job.settings,
+      job.albumId,
+      1,
+      cancelled: cancelled,
+      checkpoint: checkpoint,
+    );
+    tracks.addAll(first.tracks);
+    for (var page = 2; tracks.length < first.total; page++) {
+      await checkpoint();
+      final result = await _albumPage(
+        job.accountIdentity,
+        job.settings,
+        job.albumId,
+        page,
+        total: first.total,
+        seen: tracks.map((track) => track.id).toList(),
+        cancelled: cancelled,
+        checkpoint: checkpoint,
+      );
+      tracks.addAll(result.tracks);
+    }
+    await checkpoint();
+    await _reconcileOutputs(tracks.map((track) => track.id).toSet());
+    final next = DownloadAlbumJob.fromJson({
+      ...job.toJson(),
+      'total': first.total,
+      'page': (first.total + xmlyAlbumPageSize - 1) ~/ xmlyAlbumPageSize,
+      'seen': tracks.map((track) => track.id).toList(),
+    });
+    await _admitAlbumPage(job, next, tracks, cancelled, checkpoint, allowed);
+  }
+
+  Future<void> _admitAlbumPage(
+    DownloadAlbumJob job,
+    DownloadAlbumJob next,
+    List<Track> tracks,
+    Future<void> cancelled,
+    Future<void> Function() checkpoint,
+    bool Function() allowed,
+  ) async {
+    final batch = await _preview(
+      job.accountIdentity,
+      job.rootDirectory,
+      job.settings,
+      [
+        for (final track in tracks)
+          if (!_duplicate(job.accountIdentity, track.id) &&
+              !_tasks.values.any(
+                (item) =>
+                    item.track.id == track.id &&
+                    (item.outputDeleted ||
+                        item.state == DownloadState.cancelled &&
+                            !_hasDebit(
+                              item.accountIdentity,
+                              item.id,
+                              track.id,
+                            )),
+              ))
+            (track: track, taskId: _missingTask(track.id)?.id),
+      ],
+      album: next,
+      previewBilling: job.settings['billingPreviewPending'] != true,
+      cancelled: cancelled,
+      checkpoint: checkpoint,
+    );
+    await checkpoint();
+    await _enqueue(batch, confirmed: true, allowed: allowed);
+  }
+
+  Future<void> refreshAlbum(String id) async {
+    _albumRechecks.add(id);
+    await resumeAlbum(id);
   }
 
   /// Re-confirming a changed fee/balance keeps the original task and its receipt.
@@ -590,13 +713,15 @@ class DownloadService {
     DownloadAlbumJob? album,
     DownloadControl? control,
     bool previewBilling = true,
+    Future<void>? cancelled,
+    Future<void> Function()? checkpoint,
   }) async {
     await _requireMediaTools();
     if (!previewBilling) {
       final deferred = {...settings, 'billingPreviewPending': true};
       return DownloadBatch._(
         accountIdentity: identity,
-        rootDirectory: root,
+        rootDirectory: absoluteFilePath(root),
         settings: deferred,
         items: List.unmodifiable([
           for (final selection in selected)
@@ -605,9 +730,7 @@ class DownloadService {
               0,
               null,
               selection.taskId,
-              selection.taskId == null
-                  ? identity
-                  : task(selection.taskId!).accountIdentity,
+              _selectionIdentity(identity, selection.taskId),
             ),
         ]),
         balance: null,
@@ -628,9 +751,7 @@ class DownloadService {
       Object? failure;
       DownloadBatchItem? item;
       final attempted = <String>[];
-      final selectionIdentity = selection.taskId == null
-          ? identity
-          : task(selection.taskId!).accountIdentity;
+      final selectionIdentity = _selectionIdentity(identity, selection.taskId);
       final candidates = _candidates(
         selectionIdentity,
         settings,
@@ -641,21 +762,53 @@ class DownloadService {
         attempted.add(candidate);
         try {
           Future<DownloadBatchItem> read(XmlyClient client) async {
+            await checkpoint?.call();
             await control?.checkpoint();
-            if (candidate != 'anonymous' && refreshed.add(candidate)) {
-              await beforeAdmission?.call(candidate, client);
-            }
-            await control?.checkpoint();
-            final audio = await client.resolve(
-              selection.track.id,
-              quality: (settings['download'] as Map?)?['quality'] as String?,
-            );
-            _identity(audio, candidate, selection.track.id);
             final receipt = _receipt(
               candidate,
               selection.taskId,
               selection.track.id,
             );
+            final quality =
+                (settings['download'] as Map?)?['quality'] as String?;
+            final cached =
+                receipt == null || _freshResolves.contains(selection.taskId)
+                ? null
+                : await readRequests(
+                    client,
+                    settings,
+                    () => client.cachedPrepaidAudio(
+                      selection.track.id,
+                      quality: quality,
+                    ),
+                    control: control,
+                    cancelled: cancelled,
+                    checkpoint: checkpoint,
+                  );
+            if (cached == null &&
+                candidate != 'anonymous' &&
+                refreshed.add(candidate)) {
+              await readRequests(
+                client,
+                settings,
+                () async => await beforeAdmission?.call(candidate, client),
+                control: control,
+                cancelled: cancelled,
+                checkpoint: checkpoint,
+              );
+            }
+            await control?.checkpoint();
+            final audio =
+                cached ??
+                await readRequests<ResolvedAudio>(
+                  client,
+                  settings,
+                  () => client.resolve(selection.track.id, quality: quality),
+                  control: control,
+                  cancelled: cancelled,
+                  checkpoint: checkpoint,
+                );
+            _identity(audio, candidate, selection.track.id);
             final seconds = _reward(audio) && receipt == null
                 ? _fee(audio.track)
                 : 0;
@@ -665,9 +818,22 @@ class DownloadService {
                 throw const XmlyException('usage_uncertain', '请先核对未确认的听时扣除');
               }
               if (!balances.containsKey(candidate)) {
-                await ledger.settle(candidate);
-                balances[candidate] = (await ledger.queryQuota(candidate))
-                    .remainingSeconds;
+                await readRequests(
+                  client,
+                  settings,
+                  () => ledger.settleForDownload(candidate),
+                  control: control,
+                  cancelled: cancelled,
+                  checkpoint: checkpoint,
+                );
+                balances[candidate] = (await readRequests(
+                  client,
+                  settings,
+                  () => ledger.queryQuota(candidate),
+                  control: control,
+                  cancelled: cancelled,
+                  checkpoint: checkpoint,
+                )).remainingSeconds;
               }
               expected = balances[candidate]! - (reserved[candidate] ?? 0);
               if (expected < seconds) {
@@ -687,7 +853,13 @@ class DownloadService {
 
           final prepared = candidate == 'anonymous'
               ? await read(anonymous)
-              : await _previewAccount(candidate, read, control);
+              : await _previewAccount(
+                  candidate,
+                  read,
+                  control,
+                  cancelled: cancelled,
+                  checkpoint: checkpoint,
+                );
           item = prepared;
           reserved[candidate] = (reserved[candidate] ?? 0) + prepared.seconds;
           break;
@@ -712,7 +884,7 @@ class DownloadService {
     }
     return DownloadBatch._(
       accountIdentity: identity,
-      rootDirectory: root,
+      rootDirectory: absoluteFilePath(root),
       settings: settings,
       items: List.unmodifiable(items),
       balance: balances.length == 1 ? balances.values.single : null,
@@ -722,16 +894,35 @@ class DownloadService {
     );
   }
 
+  String _selectionIdentity(String requested, String? taskId) {
+    if (taskId == null) return requested;
+    final existing = task(taskId);
+    if (_hasDebit(existing.accountIdentity, taskId, existing.track.id) &&
+        existing.accountIdentity != requested) {
+      throw const XmlyException(
+        'original_account_required',
+        '原任务含已确认或未知的扣时，请选择原账号继续；账号已移除时请先恢复登录',
+      );
+    }
+    // Without a receipt-bound authorization, reuse the task identity while
+    // honoring the account explicitly chosen for this new request.
+    return requested;
+  }
+
   Future<T> _previewAccount<T>(
     String identity,
     Future<T> Function(XmlyClient) read,
-    DownloadControl? control,
-  ) {
-    if (control == null) return accounts.runWithAccount(identity, read);
+    DownloadControl? control, {
+    Future<void>? cancelled,
+    Future<void> Function()? checkpoint,
+  }) {
+    cancelled ??= control?.stopped;
+    checkpoint ??= control?.checkpoint;
+    if (cancelled == null) return accounts.runWithAccount(identity, read);
     var entered = false;
     final result = Completer<T>();
     final admission = accounts.runWithAccount(identity, (client) async {
-      await control.checkpoint();
+      await checkpoint?.call();
       entered = true;
       return read(client);
     });
@@ -743,7 +934,7 @@ class DownloadService {
         if (!result.isCompleted) result.completeError(error, stack);
       },
     );
-    control._stopped.future.then((_) {
+    cancelled.then((_) {
       if (!entered && !result.isCompleted)
         result.completeError(const DownloadStopped());
     });
@@ -824,9 +1015,9 @@ class DownloadService {
       throw const XmlyException('batch_invalid', '下载确认已失效');
     if (!confirmed) return;
     await _checkRoot(batch.rootDirectory, batch.settings);
-    final parallelism = _option(batch.settings, 'parallelism', 3, 1, 6);
+    _option(batch.settings, 'parallelism', 3, 1, 6);
     await _reconcileOutputs(batch.items.map((item) => item.track.id).toSet());
-    Future<void> admit(XmlyClient _) => _updates.synchronized(() async {
+    Future<void> persist() => _updates.synchronized(() async {
       _ensureOpen();
       if (allowed != null && !allowed()) throw const DownloadStopped();
       final next = Map<String, DownloadTask>.from(_tasks);
@@ -842,14 +1033,24 @@ class DownloadService {
             ))
           continue;
         if (item.taskId == null) {
-          if (_duplicate(item.accountIdentity, item.track.id, source: next))
+          if (_duplicate(item.accountIdentity, item.track.id, source: next) ||
+              next.values.any(
+                (existing) =>
+                    existing.track.id == item.track.id &&
+                    _hasDebit(
+                      existing.accountIdentity,
+                      existing.id,
+                      existing.track.id,
+                    ),
+              )) {
             continue;
+          }
           final id = const Uuid().v4();
           final created = DownloadTask(
             id: id,
             accountIdentity: item.accountIdentity,
             track: item.track,
-            rootDirectory: batch.rootDirectory,
+            rootDirectory: absoluteFilePath(batch.rootDirectory),
             settings: _taskSettings(batch.settings, item.track),
             createdAt: DateTime.now(),
             costSeconds: item.seconds,
@@ -878,6 +1079,9 @@ class DownloadService {
             throw const XmlyException('task_busy', '下载任务已变化，请重新确认');
           }
           final resumed = existing.copyWith(
+            outputMissing: false,
+            outputDeleted: false,
+            warning: existing.outputDeleted ? null : existing.warning,
             track: item.track,
             settings: {
               for (final entry in existing.settings.entries)
@@ -906,17 +1110,17 @@ class DownloadService {
       if (beforeStart != null) await beforeStart(List.unmodifiable(admitted));
       final album = batch.album;
       if (album != null) {
-        final pageTracks = album.seen
-            .skip((album.page - 1) * xmlyAlbumPageSize)
-            .toSet();
-        album.taskIds = next.values
-            .where(
-              (item) =>
-                  pageTracks.contains(item.track.id) &&
-                  item.state != DownloadState.cancelled,
-            )
-            .map((item) => item.id)
-            .toList();
+        // Track actual admissions, including a task resumed with its receipt
+        // or assigned to another account by polling. Matching track IDs alone
+        // must never take ownership of an independent download.
+        album.taskIds =
+            {...?_albums[album.id]?.taskIds, ...admitted.map((item) => item.id)}
+                .where(
+                  (id) =>
+                      next.containsKey(id) &&
+                      next[id]!.state != DownloadState.cancelled,
+                )
+                .toList();
         album.state = 'running';
         album.error = null;
       }
@@ -938,10 +1142,12 @@ class DownloadService {
         ..clear()
         ..addAll(next);
       if (album != null) _albums[album.id] = album;
-      _parallelism = parallelism;
       _suspended = false;
       _notify();
     });
+    // Account changes can hold their mutex while pausing the queue. Acquire the
+    // queue command lock only after admission has entered that account mutex.
+    Future<void> admit(XmlyClient _) => _queueCommands.synchronized(persist);
     if (batch.accountIdentity == 'anonymous') {
       await admit(anonymous);
     } else {
@@ -952,42 +1158,95 @@ class DownloadService {
 
   Future<void> pause(String id) => _stop(id, cancel: false);
   Future<void> cancel(String id) => _stop(id, cancel: true);
-  Future<void> _stop(String id, {required bool cancel}) async {
+  Future<void> _stop(String id, {required bool cancel}) =>
+      _stopTasks([id], cancel: cancel);
+
+  Future<void> _stopTasks(
+    Iterable<String> ids, {
+    required bool cancel,
+    String? albumId,
+  }) async {
     _ensureOpen();
-    _stopping.add(id);
-    try {
-      final worker = _workers[id];
-      worker?.control._stop(cancel: cancel);
-      await _change(
-        id,
-        (item) => item.state == DownloadState.completed
-            ? item
-            : item.copyWith(
-                state: cancel ? DownloadState.cancelled : DownloadState.paused,
-                bytesPerSecond: 0,
-                retryAt: null,
-                processingFailed:
-                    item.processingFailed ||
-                    item.state == DownloadState.processing,
-              ),
-      );
-      await worker?.done;
-      await _change(
-        id,
-        (item) => item.state == DownloadState.completed
-            ? item
-            : item.copyWith(
-                state: cancel ? DownloadState.cancelled : DownloadState.paused,
-                bytesPerSecond: 0,
-                retryAt: null,
-                processingFailed:
-                    item.processingFailed ||
-                    item.state == DownloadState.processing,
-              ),
-      );
-    } finally {
-      _stopping.remove(id);
+    final state = cancel ? DownloadState.cancelled : DownloadState.paused;
+    final targets = <String>{};
+    void signal(Iterable<String> values) {
+      for (final id in values) {
+        if (!targets.add(id)) continue;
+        _stopping.update(id, (count) => count + 1, ifAbsent: () => 1);
+        _workers[id]?.control._stop(cancel: cancel);
+      }
     }
+
+    if (albumId != null) {
+      final stop = _albumStops[albumId];
+      if (stop != null && !stop.isCompleted) stop.complete();
+      _stoppingAlbums.update(albumId, (count) => count + 1, ifAbsent: () => 1);
+      _albums[albumId]!.state = state.name;
+    }
+    // Notify every producer before waiting. Pending album stops also cover a
+    // page whose admission is still publishing its newly persisted tasks.
+    signal(ids);
+    await _queueCommands.synchronized(() async {
+      try {
+        if (albumId != null) signal(_albums[albumId]!.taskIds);
+        await Future.wait([
+          for (final id in targets)
+            if (_workers[id] case final worker?) worker.done,
+        ]);
+        await _updates.synchronized(() async {
+          final stopped = <String, DownloadTask>{};
+          for (final id in targets) {
+            final item = task(id);
+            if (item.state == DownloadState.completed ||
+                albumId != null && !cancel && !item.active) {
+              continue;
+            }
+            stopped[id] = item.copyWith(
+              state: state,
+              bytesPerSecond: 0,
+              retryAt: null,
+              processingFailed:
+                  item.processingFailed ||
+                  item.state == DownloadState.processing,
+            );
+          }
+          final album = albumId == null ? null : _albums[albumId]!;
+          if (album != null) album.state = state.name;
+          try {
+            await _save({..._tasks, ...stopped});
+          } catch (_) {
+            final message = cancel
+                ? '取消状态保存失败，请检查资料目录后重新打开应用'
+                : '暂停状态保存失败，请检查资料目录后重新打开应用';
+            stopped.updateAll((id, item) => item.copyWith(error: message));
+            if (album != null) album.error = message;
+            rethrow;
+          } finally {
+            _tasks.addAll(stopped);
+            _notify();
+          }
+        });
+      } finally {
+        for (final id in targets) {
+          final remaining = _stopping[id]! - 1;
+          if (remaining == 0) {
+            _stopping.remove(id);
+          } else {
+            _stopping[id] = remaining;
+          }
+        }
+        if (albumId != null) {
+          final remaining = _stoppingAlbums[albumId]! - 1;
+          if (remaining == 0) {
+            _stoppingAlbums.remove(albumId);
+          } else {
+            _stoppingAlbums[albumId] = remaining;
+          }
+        }
+        // Finish the stop before the next continue command can start.
+        _pump();
+      }
+    });
   }
 
   static Future<bool> _outputExists(DownloadTask item) async =>
@@ -1000,26 +1259,60 @@ class DownloadService {
     retryAt: null,
     processingFailed: false,
     outputMissing: true,
+    outputDeleted: false,
   );
 
   DownloadTask? _missingTask(String trackId) => _tasks.values
       .where(
         (item) =>
             item.track.id == trackId &&
-            item.state == DownloadState.failed &&
-            item.outputMissing,
+            !item.active &&
+            (item.outputMissing ||
+                item.state != DownloadState.completed &&
+                    _hasDebit(item.accountIdentity, item.id, trackId)),
       )
       .firstOrNull;
 
   /// Called only after a user-authorized file deletion succeeds.
   /// Keep the original task/account/receipt so retry cannot charge a new task.
-  Future<void> markAudioDeleted(String id) async {
+  Future<void> markAudioDeleted(String id, {String? expectedPath}) async {
     _ensureOpen();
-    await _change(
-      id,
-      (item) =>
-          item.state == DownloadState.completed ? _missingOutput(item) : item,
-    );
+    await _change(id, (item) {
+      if (expectedPath != null &&
+          (item.state != DownloadState.completed ||
+              item.finalPath != expectedPath)) {
+        throw const XmlyException('download_changed', '下载记录已变化，请刷新后检查音频');
+      }
+      return item.state == DownloadState.completed
+          ? item.copyWith(
+              state: DownloadState.paused,
+              finalPath: null,
+              error: null,
+              warning: '音频已主动删除，可重新下载',
+              bytesPerSecond: 0,
+              retryAt: null,
+              processingFailed: false,
+              outputMissing: true,
+              outputDeleted: true,
+              userConfirmed: false,
+              needsConfirmation: true,
+            )
+          : item;
+    });
+  }
+
+  Future<void> markAudioMissing(
+    String id, {
+    required String expectedPath,
+  }) async {
+    _ensureOpen();
+    await _change(id, (item) {
+      if (item.state != DownloadState.completed ||
+          item.finalPath != expectedPath) {
+        throw const XmlyException('download_changed', '下载记录已变化，请刷新后检查音频');
+      }
+      return _missingOutput(item);
+    });
   }
 
   Future<void> _reconcileOutputs(Set<String> trackIds) =>
@@ -1042,27 +1335,39 @@ class DownloadService {
         _notify();
       });
 
-  Future<void> resume(String id) async {
+  Future<void> resume(String id, {bool Function()? isActive}) =>
+      _queueCommands.synchronized(() => _resume(id, isActive: isActive));
+
+  Future<void> _resume(String id, {bool Function()? isActive}) async {
     _ensureOpen();
     final worker = _workers[id];
-    if (worker != null) await worker.done;
+    if (worker != null) {
+      // An active worker needs no resume. Do not hold up a later pause command.
+      if (!worker.control.paused && !worker.control.cancelled) return;
+      await worker.done;
+    }
+    _ensureOpen();
+    if (isActive != null && !isActive()) throw const DownloadStopped();
     final item = task(id);
     if (item.state == DownloadState.completed || item.active) return;
     if (!item.processingFailed &&
         (item.needsConfirmation || !item.userConfirmed)) {
       throw const XmlyException('confirmation_required', '请重新确认本次听时和余额');
     }
-    _automaticGuards.remove(id); // A manual continue is a fresh user action.
-    await _change(
-      id,
-      (item) => item.copyWith(
+    await _change(id, (item) {
+      // Playback may have been cancelled while this command waited to update.
+      if (isActive != null && !isActive()) throw const DownloadStopped();
+      _automaticGuards.remove(id); // A manual continue is a fresh user action.
+      return item.copyWith(
+        outputMissing: false,
+        outputDeleted: false,
         state: DownloadState.queued,
         error: null,
         retryAt: null,
         retryCount: 0,
         attemptedAccounts: const [],
-      ),
-    );
+      );
+    });
     _suspended = false;
     _pump();
   }
@@ -1084,8 +1389,21 @@ class DownloadService {
       );
     }
     if (reacquire) {
-      await discardSource?.call(item);
+      Future<void> revoke(XmlyClient client) async {
+        await discardSource?.call(item);
+        // Revoke all qualities for just this account/track, including leases
+        // with no known expiry, before allowing an explicit replacement.
+        client.invalidate(item.track.id);
+        await client.flushUrlCache();
+      }
+
+      if (item.accountIdentity == 'anonymous') {
+        await revoke(anonymous);
+      } else {
+        await accounts.runWithAccount(item.accountIdentity, revoke);
+      }
       await _change(id, (value) => value.copyWith(processingFailed: false));
+      _freshResolves.add(id);
     }
     await resume(id);
   }
@@ -1150,7 +1468,7 @@ class DownloadService {
         'rootDirectory': directory,
       };
       return value.copyWith(
-        rootDirectory: p.normalize(directory),
+        rootDirectory: absoluteFilePath(directory),
         settings: settings,
         state: DownloadState.paused,
         processingFailed: false,
@@ -1165,43 +1483,57 @@ class DownloadService {
     });
   }
 
-  Future<void> pauseAll() async {
+  Future<void> pauseAll() {
     _suspended = true;
-    for (final job in _albums.values) {
-      if (job.state == 'running') job.state = 'paused';
+    for (final stop in _albumStops.values) {
+      if (!stop.isCompleted) stop.complete();
     }
-    await _updates.synchronized(() => _save(_tasks));
     for (final worker in _workers.values) {
       worker.control._stop(cancel: false);
     }
-    for (final item in tasks.where((item) => item.active)) {
-      await _change(
-        item.id,
-        (value) => value.copyWith(
-          state: DownloadState.paused,
-          bytesPerSecond: 0,
-          retryAt: null,
-          processingFailed:
-              value.processingFailed || value.state == DownloadState.processing,
-        ),
-      );
-    }
-    await Future.wait(_workers.values.map((worker) => worker.done).toList());
-    for (final item in tasks.where((item) => item.active)) {
-      await _change(
-        item.id,
-        (value) => value.copyWith(
-          state: DownloadState.paused,
-          bytesPerSecond: 0,
-          retryAt: null,
-          processingFailed:
-              value.processingFailed || value.state == DownloadState.processing,
-        ),
-      );
-    }
+    return _queueCommands.synchronized(() async {
+      for (final job in _albums.values) {
+        if (job.state == 'running') job.state = 'paused';
+      }
+      final workers = _workers.values.toList();
+      for (final worker in workers) {
+        worker.control._stop(cancel: false);
+      }
+      // Stopping must not depend on a writable state directory. Drain producers
+      // before taking the final snapshot so late worker updates cannot undo it.
+      await Future.wait(workers.map((worker) => worker.done));
+      await _updates.synchronized(() async {
+        final next = Map<String, DownloadTask>.from(_tasks);
+        final paused = tasks.where((item) => item.active).toList();
+        for (final item in paused) {
+          next[item.id] = item.copyWith(
+            state: DownloadState.paused,
+            bytesPerSecond: 0,
+            retryAt: null,
+            processingFailed:
+                item.processingFailed || item.state == DownloadState.processing,
+          );
+        }
+        try {
+          await _save(next);
+        } catch (_) {
+          for (final item in paused) {
+            next[item.id] = next[item.id]!.copyWith(
+              error: '暂停状态保存失败，请检查资料目录后重新打开应用',
+            );
+          }
+          rethrow;
+        } finally {
+          _tasks
+            ..clear()
+            ..addAll(next);
+          _notify();
+        }
+      });
+    });
   }
 
-  Future<void> resumeAll() async {
+  Future<void> resumeAll() => _queueCommands.synchronized(() async {
     _ensureOpen();
     await Future.wait(
       _workers.values
@@ -1219,19 +1551,26 @@ class DownloadService {
       await _change(
         item.id,
         (value) => value.copyWith(
+          outputMissing: false,
+          outputDeleted: false,
           state: DownloadState.queued,
           error: null,
           retryAt: null,
+          retryCount: 0,
+          attemptedAccounts: const [],
         ),
       );
     }
     _suspended = false;
     for (final job in _albums.values) {
-      if (job.state == 'paused') job.state = 'running';
+      if (job.state == 'paused') {
+        _albumRechecks.add(job.id);
+        job.state = 'running';
+      }
     }
     await _updates.synchronized(() => _save(_tasks));
     _pump();
-  }
+  });
 
   void prioritize(String? taskId) {
     if (taskId != null) task(taskId);
@@ -1239,13 +1578,27 @@ class DownloadService {
     _pump();
   }
 
+  /// Apply a saved global limit without resuming a paused queue or stopping work.
+  void settingsChanged() => _pump();
+
   void _pump() {
     if (_closed || _suspended || !_loaded) return;
+    final parallelism = _option(
+      storage.state['settings'] as Map,
+      'parallelism',
+      3,
+      1,
+      6,
+    );
     _pumpAlbums();
+    final stoppedAlbumTasks = {
+      for (final id in _stoppingAlbums.keys) ..._albums[id]!.taskIds,
+    };
     for (final item in tasks.where(
       (item) =>
           item.state == DownloadState.queued &&
-          !_stopping.contains(item.id) &&
+          !_stopping.containsKey(item.id) &&
+          !stoppedAlbumTasks.contains(item.id) &&
           !(_automaticGuards[item.id]?.call() ?? true),
     )) {
       unawaited(
@@ -1263,7 +1616,8 @@ class DownloadService {
           (item) =>
               item.state == DownloadState.queued &&
               !_workers.containsKey(item.id) &&
-              !_stopping.contains(item.id) &&
+              !_stopping.containsKey(item.id) &&
+              !stoppedAlbumTasks.contains(item.id) &&
               (_automaticGuards[item.id]?.call() ?? true),
         )
         .toList();
@@ -1272,7 +1626,7 @@ class DownloadService {
       if (index > 0) pending.insert(0, pending.removeAt(index));
     }
     for (final item in pending) {
-      if (_workers.length >= _parallelism) break;
+      if (_workers.length >= parallelism) break;
       final control = DownloadControl._(
         (received, total, rate) {
           final current = task(item.id);
@@ -1306,6 +1660,7 @@ class DownloadService {
   }
 
   Future<void> _run(String id, DownloadControl control) async {
+    var quoteRefreshes = 0;
     try {
       if (!(_automaticGuards[id]?.call() ?? true))
         throw const DownloadStopped();
@@ -1324,13 +1679,7 @@ class DownloadService {
             await control.processing();
             path = await process(task(id), control);
           } else {
-            final audio = await _admissionOrder
-                .putIfAbsent(task(id).accountIdentity, Lock.new)
-                .synchronized(() async {
-                  await control.checkpoint();
-                  await _checkRoot(task(id).rootDirectory, task(id).settings);
-                  return _admit(id, control);
-                });
+            final audio = await _orderedAdmission(id, control);
             await control.checkpoint();
             await _change(
               id,
@@ -1344,7 +1693,8 @@ class DownloadService {
             // Network producers enter only after normal account admission.
             path = await transfer(task(id), audio, control);
           }
-          await control.checkpoint();
+          // The backend returns only after committing a verified output. A
+          // concurrent pause/cancel must preserve this completed result.
           if (!p.isAbsolute(path)) {
             throw const XmlyException('invalid_output', '媒体处理未返回有效成品路径');
           }
@@ -1357,18 +1707,24 @@ class DownloadService {
               error: null,
               processingFailed: false,
               outputMissing: false,
+              outputDeleted: false,
             ),
           );
           return;
         } catch (error) {
           if (error is DownloadStopped) rethrow;
+          if (error is XmlyException &&
+              error.code == 'confirmation_changed' &&
+              task(id).userConfirmed &&
+              quoteRefreshes++ == 0)
+            continue;
           if (await _rotate(id, error, control)) continue;
           // API/transport own bounded request retries; do not multiply them here.
           rethrow;
         }
       }
     } on DownloadStopped {
-      // The caller persisted pause/cancel before waiting for this worker to drain.
+      // The caller owns the stopped state and waits for this worker to drain.
     } catch (error) {
       try {
         final changed =
@@ -1376,7 +1732,8 @@ class DownloadService {
             const {
               'confirmation_changed',
               'confirmation_required',
-            }.contains(error.code);
+            }.contains(error.code) &&
+            !task(id).userConfirmed;
         await _change(
           id,
           (item) =>
@@ -1444,9 +1801,6 @@ class DownloadService {
       final candidate = batch.items.single;
       if (candidate.error != null) continue;
       await control.checkpoint();
-      if (candidate.seconds > current.costSeconds) {
-        throw const XmlyException('confirmation_changed', '本集听时已变化，请重新确认');
-      }
       await _change(
         id,
         (item) => item.copyWith(
@@ -1464,6 +1818,34 @@ class DownloadService {
       return true;
     }
     return false;
+  }
+
+  Future<ResolvedAudio> _orderedAdmission(String id, DownloadControl control) {
+    // A stopped worker must not wait for another task's admission while holding
+    // the command lock. Once entered, keep waiting for any debit to be journaled.
+    var entered = false;
+    final result = Completer<ResolvedAudio>();
+    final admission = _admissionOrder
+        .putIfAbsent(task(id).accountIdentity, Lock.new)
+        .synchronized(() async {
+          entered = true;
+          await control.checkpoint();
+          await _checkRoot(task(id).rootDirectory, task(id).settings);
+          return _admit(id, control);
+        });
+    admission.then(
+      (audio) {
+        if (!result.isCompleted) result.complete(audio);
+      },
+      onError: (Object error, StackTrace stack) {
+        if (!result.isCompleted) result.completeError(error, stack);
+      },
+    );
+    control.stopped.then((_) {
+      if (!entered && !result.isCompleted)
+        result.completeError(const DownloadStopped());
+    });
+    return result.future;
   }
 
   Future<ResolvedAudio> _admit(String id, DownloadControl control) async {
@@ -1517,11 +1899,28 @@ class DownloadService {
               )) {
         throw const XmlyException('usage_uncertain', '请先核对本集未确认的听时扣除');
       }
+      final previous = _receipt(current.accountIdentity, id, current.track.id);
+      final fresh = _freshResolves.contains(id);
+      final quality =
+          (current.settings['download'] as Map?)?['quality'] as String?;
+      final cached = previous == null || fresh
+          ? null
+          : await readRequests(
+              client,
+              current.settings,
+              () =>
+                  client.cachedPrepaidAudio(current.track.id, quality: quality),
+              control: control,
+            );
+      await control.checkpoint();
       int? expectedBalance = current.expectedBalance;
-      if (current.accountIdentity != 'anonymous') {
-        final claimed = await beforeAdmission?.call(
-          current.accountIdentity,
+      if (cached == null && current.accountIdentity != 'anonymous') {
+        final claimed = await readRequests(
           client,
+          current.settings,
+          () async =>
+              await beforeAdmission?.call(current.accountIdentity, client),
+          control: control,
         );
         if (claimed != null && claimed > 0) {
           await _updates.synchronized(() async {
@@ -1545,22 +1944,50 @@ class DownloadService {
         }
         await control.checkpoint();
       }
-      final audio = await client.resolve(
-        current.track.id,
-        quality: (current.settings['download'] as Map?)?['quality'] as String?,
-      );
+      final audio =
+          cached ??
+          await readRequests<ResolvedAudio>(
+            client,
+            current.settings,
+            () => client.resolve(
+              current.track.id,
+              quality: quality,
+              force: fresh,
+              preferCached: previous == null && !fresh,
+            ),
+            control: control,
+          );
+      _freshResolves.remove(id);
       _identity(audio, current.accountIdentity, current.track.id);
       await control.checkpoint();
       final reward = _reward(audio);
-      final previous = _receipt(current.accountIdentity, id, current.track.id);
       if (reward &&
           previous == null &&
           ledger.isBlocked(current.accountIdentity)) {
         throw const XmlyException('usage_uncertain', '请先核对未确认的听时扣除');
       }
-      if (previous == null &&
-          (reward ? _fee(audio.track) : 0) != current.costSeconds) {
-        throw const XmlyException('confirmation_changed', '本集听时已变化，请重新确认');
+      if (previous == null && current.userConfirmed) {
+        // The start action authorizes this selected track and configured account
+        // policy; revalidate a stale quote, never replay an uncertain debit.
+        final seconds = reward ? _fee(audio.track) : 0;
+        expectedBalance = seconds == 0
+            ? null
+            : (await readRequests(
+                client,
+                current.settings,
+                () => ledger.queryQuota(current.accountIdentity),
+                control: control,
+              )).remainingSeconds;
+        await control.checkpoint();
+        await _change(
+          id,
+          (item) => item.copyWith(
+            costSeconds: seconds,
+            expectedBalance: expectedBalance,
+            needsConfirmation: false,
+          ),
+        );
+        current = task(id);
       }
       await _change(
         id,
@@ -1574,14 +2001,19 @@ class DownloadService {
       if (reward) {
         final receipt =
             previous ??
-            await ledger.prepay(
-              identity: current.accountIdentity,
-              taskId: id,
-              audio: audio,
-              userConfirmed: current.userConfirmed,
-              expectedSeconds: current.costSeconds,
-              expectedBalance: expectedBalance,
-              wait: control.wait,
+            await readRequests(
+              client,
+              current.settings,
+              () => ledger.prepay(
+                identity: current.accountIdentity,
+                taskId: id,
+                audio: audio,
+                userConfirmed: current.userConfirmed,
+                expectedSeconds: current.costSeconds,
+                expectedBalance: expectedBalance,
+                wait: control.wait,
+              ),
+              control: control,
             );
         if (receipt == null ||
             receipt.state != DebitState.confirmed ||
@@ -1650,9 +2082,10 @@ class DownloadService {
     (item) =>
         item.track.id == trackId &&
         (item.state == DownloadState.completed ||
+            item.active && _hasDebit(item.accountIdentity, item.id, trackId) ||
             item.accountIdentity == identity &&
                 item.deduplicates &&
-                !item.outputMissing),
+                (item.active || !item.outputMissing)),
   );
   DownloadReceipt? _receipt(String identity, String? taskId, String trackId) {
     if (taskId == null || identity == 'anonymous') return null;
@@ -1667,10 +2100,9 @@ class DownloadService {
     return null;
   }
 
-  static bool _reward(ResolvedAudio audio) =>
-      audio.requiresReward &&
-      audio.track.isPaid != false &&
-      audio.track.isAuthorized != true;
+  // A quota-based authorization may also return isAuthorized.
+  // The resolver retains whether that permission required listening quota.
+  static bool _reward(ResolvedAudio audio) => audio.requiresReward;
   static int _fee(Track track) {
     if (!track.duration.isFinite ||
         track.duration <= 0 ||
@@ -1701,9 +2133,29 @@ class DownloadService {
     intro: fresh.intro.isEmpty ? selected.intro : fresh.intro,
     raw: {
       ...fresh.raw,
+      if (fresh.albumId.isEmpty || fresh.albumId == selected.albumId)
+        'totalCount':
+            xmlyPositive(fresh.raw['totalCount']) ??
+            xmlyPositive(fresh.raw['total']) ??
+            xmlyPositive(selected.raw['totalCount']) ??
+            xmlyPositive(selected.raw['total']),
       if (selected.officialPosition != null)
         'officialPosition': selected.officialPosition,
     },
+  );
+  static Future<T> readRequests<T>(
+    XmlyClient client,
+    Map settings,
+    Future<T> Function() action, {
+    DownloadControl? control,
+    Future<void>? cancelled,
+    Future<void> Function()? checkpoint,
+  }) => client.withReadPolicy(
+    action,
+    rateLimitRetries: _option(settings, 'retryLimit', 3, 0, 1000),
+    minimumRateLimitDelay: const Duration(minutes: 5),
+    cancelled: cancelled ?? control?.stopped,
+    checkpoint: checkpoint ?? control?.checkpoint,
   );
   static int _option(Map settings, String key, int fallback, int min, int max) {
     final download = settings['download'];
@@ -1737,9 +2189,17 @@ class DownloadService {
     // Never persist third-party messages (they can contain signed URLs/secrets).
     if (error is XmlyException) {
       switch (error.code) {
+        case 'original_account_required':
+          return '原任务含已确认或未知的扣时，请先登录并选择原账号继续';
         case 'confirmation_changed':
         case 'confirmation_required':
-          return '听时或余额已变化，请重新确认';
+          return '听时或余额持续变化，本次下载已停止；任务和扣时记录保留，请稍后重试';
+        case 'catalogue_changed':
+          return '专辑在刷新期间再次变化，已停止；已下载内容和扣时记录保留，请稍后继续';
+        case 'catalogue_limit':
+          return '专辑超过 5000 集下载上限，已停止；已下载内容和扣时记录保留';
+        case 'invalid_catalogue':
+          return '专辑分页、顺序或声音 ID 无效，已停止；已下载内容和扣时记录保留';
         case 'usage_uncertain':
         case 'receipt_required':
           return '听时扣除尚未确认，请先核对';
@@ -1779,6 +2239,8 @@ class DownloadService {
               : '无法启动媒体工具，请检查路径';
         case 'media_probe':
           return '无法识别有效音轨或时长，源缓存已保留，请选择重新获取或其他格式';
+        case 'media_incomplete':
+          return '音频时长明显短于标注时长，请重新获取音频；源缓存和已有扣时收据已保留';
         case 'media_hash':
         case 'media_validation':
           return '音频校验失败，源缓存已保留，请选择其他格式后重试';
@@ -1822,8 +2284,9 @@ class DownloadService {
 
   Future<void> close() async {
     if (_closed) return;
+    // A failed load must not overwrite persisted tasks with the empty queue.
+    if (_loaded) await pauseAll();
     _closed = true;
-    await pauseAll();
     await _changes.close();
   }
 }

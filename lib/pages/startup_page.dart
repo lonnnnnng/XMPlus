@@ -8,6 +8,7 @@ import '../common/theme.dart';
 import '../storage/app_storage.dart';
 import '../storage/flutter_credential_store.dart';
 import '../services/app_runtime.dart';
+import '../services/account_service.dart';
 
 class StartupPage extends StatefulWidget {
   const StartupPage({required this.arguments, super.key});
@@ -82,7 +83,10 @@ class _StartupPageState extends State<StartupPage> {
       await candidate?.close();
       if (mounted)
         setState(() {
-          _error = error is StorageException || error is FormatException
+          _error =
+              error is StorageException ||
+                  error is FormatException ||
+                  error is AccountException
               ? error.toString()
               : '无法打开资料目录，请检查目录权限后重试';
         });
@@ -95,8 +99,12 @@ class _StartupPageState extends State<StartupPage> {
   }
 
   Future<void> _choose() async {
-    final value = await FilePicker.getDirectoryPath(dialogTitle: '选择资料目录');
-    if (value != null) await _open(value);
+    try {
+      final value = await FilePicker.getDirectoryPath(dialogTitle: '选择资料目录');
+      if (value != null && mounted) await _open(value);
+    } catch (_) {
+      if (mounted) setState(() => _error = '无法选择资料目录，请重试');
+    }
   }
 
   @override

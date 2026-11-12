@@ -11,6 +11,8 @@ class PlaybackSettings {
     required this.loopMode,
     required this.listenAndDownload,
     required this.volume,
+    required this.masterVolume,
+    required this.masterMuted,
   });
 
   final double speed;
@@ -22,13 +24,18 @@ class PlaybackSettings {
   final String loopMode;
   final bool listenAndDownload;
   final double volume;
+  final double masterVolume;
+  final bool masterMuted;
+  double get outputVolume => masterMuted ? 0 : volume * masterVolume / 100;
 
   factory PlaybackSettings.parse(Map values) => resolve(values);
 
   static PlaybackSettings resolve(Map global, [Map album = const {}]) {
     Object? value(String key, Object fallback) => album.containsKey(key)
         ? album[key]
-        : global.containsKey(key) ? global[key] : fallback;
+        : global.containsKey(key)
+        ? global[key]
+        : fallback;
 
     double number(String key, double fallback, double min, double max) {
       final raw = value(key, fallback);
@@ -40,7 +47,10 @@ class PlaybackSettings {
 
     int seconds(String key, int fallback, int min, int max) {
       final raw = value(key, fallback);
-      if (raw is! num || !raw.isFinite || raw < min || raw > max ||
+      if (raw is! num ||
+          !raw.isFinite ||
+          raw < min ||
+          raw > max ||
           raw != raw.truncateToDouble()) {
         throw FormatException('播放设置 $key 必须为 $min–$max 的整数');
       }
@@ -57,6 +67,17 @@ class PlaybackSettings {
     if (loop != 'off' && loop != 'single') {
       throw const FormatException('循环方式必须为 off 或 single');
     }
+    final masterVolume = global['masterVolume'] ?? 100;
+    if (masterVolume is! num ||
+        !masterVolume.isFinite ||
+        masterVolume < 0 ||
+        masterVolume > 100) {
+      throw const FormatException('主音量必须在 0–100 之间');
+    }
+    final masterMuted = global['masterMuted'] ?? false;
+    if (masterMuted is! bool) {
+      throw const FormatException('主音量静音必须为开关值');
+    }
     return PlaybackSettings._(
       speed: number('speed', 1, 0.5, 3),
       skipIntroSeconds: seconds('skipIntroSeconds', 0, 0, 3600),
@@ -67,6 +88,8 @@ class PlaybackSettings {
       loopMode: loop as String,
       listenAndDownload: boolean('listenAndDownload', false),
       volume: number('volume', 100, 0, 100),
+      masterVolume: masterVolume.toDouble(),
+      masterMuted: masterMuted,
     );
   }
 
@@ -80,10 +103,13 @@ class PlaybackSettings {
     'loopMode': loopMode,
     'listenAndDownload': listenAndDownload,
     'volume': volume,
+    'masterVolume': masterVolume,
+    'masterMuted': masterMuted,
   };
 }
 
 enum SleepAction { pause, exit }
+
 enum SleepMode { afterDuration, endOfTrack }
 
 /// Persist this preset only; an armed deadline belongs to the current process.
@@ -106,10 +132,13 @@ class SleepRequest {
 
   factory SleepRequest.fromJson(Map values) {
     final minutes = values.containsKey('minutes') ? values['minutes'] : 30;
-    final wait = values.containsKey('waitForEnd') ? values['waitForEnd'] : false;
+    final wait = values.containsKey('waitForEnd')
+        ? values['waitForEnd']
+        : false;
     final mode = values.containsKey('mode') ? values['mode'] : 'afterDuration';
     final action = values.containsKey('action') ? values['action'] : 'pause';
-    if (minutes is! int || wait is! bool ||
+    if (minutes is! int ||
+        wait is! bool ||
         !SleepMode.values.any((value) => value.name == mode) ||
         !SleepAction.values.any((value) => value.name == action)) {
       throw const FormatException('定时设置格式不正确');
@@ -143,8 +172,9 @@ class PlaybackPolicy {
   DateTime? _deadline;
   bool _sleepWaitingForEnd = false;
 
-  String? get warning => _duration > 0 &&
-      _settings.skipIntroSeconds + _settings.skipOutroSeconds >= _duration
+  String? get warning =>
+      _duration > 0 &&
+          _settings.skipIntroSeconds + _settings.skipOutroSeconds >= _duration
       ? '片头和片尾合计不小于本集时长，已关闭本集自动跳过'
       : null;
 
@@ -171,12 +201,20 @@ class PlaybackPolicy {
 
   /// A single chapter epoch emits at most one completion, regardless of whether
   /// an outro threshold or the device's physical end event arrives first.
-  bool observe(double actualPosition, {double? duration, bool completed = false}) {
-    if (!_started || _finished) return false;
+  bool observe(
+    double actualPosition, {
+    double? duration,
+    bool completed = false,
+    bool allowCompletion = true,
+  }) {
+    if (!_started) return false;
     if (duration != null) _duration = _knownDuration(duration);
-    final atEnd = actualPosition.isFinite && _duration > 0 &&
-        actualPosition >= _duration;
-    final atOutro = _canSkip && _settings.skipOutroSeconds > 0 &&
+    if (_finished || !allowCompletion) return false;
+    final atEnd =
+        actualPosition.isFinite && _duration > 0 && actualPosition >= _duration;
+    final atOutro =
+        _canSkip &&
+        _settings.skipOutroSeconds > 0 &&
         actualPosition.isFinite &&
         actualPosition >= _duration - _settings.skipOutroSeconds;
     if (!completed && !atEnd && !atOutro) return false;
@@ -230,8 +268,10 @@ class PlaybackPolicy {
 
   SleepAction? pollSleep() {
     final request = _sleepRequest;
-    if (request == null || request.mode == SleepMode.endOfTrack ||
-        _clock().isBefore(_deadline!)) return null;
+    if (request == null ||
+        request.mode == SleepMode.endOfTrack ||
+        _clock().isBefore(_deadline!))
+      return null;
     if (request.waitForEnd) {
       _sleepWaitingForEnd = true;
       return null;

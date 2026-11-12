@@ -181,7 +181,7 @@ class XmlyLogin {
         url: 'https://passport.ximalaya.com/$path',
       );
       final bytes = <int>[];
-      diagnostic.responseByteCount = () => bytes.length;
+      diagnostic.responseBytes = () => bytes;
       final headers = <String, dynamic>{
         'User-Agent': 'ting_9.5.1(M2102J2SC,Android31)',
         'Cookie':

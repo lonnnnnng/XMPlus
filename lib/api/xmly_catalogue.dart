@@ -43,41 +43,32 @@ class XmlyCatalogue {
     for (final value in [track.orderNo, track.raw['order_no'], track.raw['orderNo'], track.raw['orderNum'], track.raw['sequence'], track.raw['index'], track.episode]) {
       try { return episodeNumber(value); } on XmlyException { /* Try the next original ordinal field. */ }
     }
-    return titleEpisode(track);
+    return null;
   }
   static Track selectEpisode(List<Track> items, Object episode) {
     final number = episodeNumber(episode);
-    final titled = items.any((item) => titleEpisode(item) != null);
-    final matches = items.where((item) => (titled ? titleEpisode(item) : _itemOrder(item)) == number).toList();
-    if (matches.length > 1) throw const XmlyException('ambiguous_episode', '该集数对应多个声音，请直接选择声音', definitive: true);
-    if (matches.isEmpty) throw const XmlyException('episode_not_found', '专辑中没有找到该集', definitive: true);
-    return matches.single;
+    for (final parse in const [titleEpisode, _itemOrder]) {
+      var hasEpisodes = false;
+      Track? match;
+      for (final item in items) {
+        final value = parse(item);
+        if (value == null) continue;
+        hasEpisodes = true;
+        if (value != number) continue;
+        if (match != null) throw const XmlyException('ambiguous_episode', '该集数对应多个声音，请直接选择声音', definitive: true);
+        match = item;
+      }
+      if (match != null) return match;
+      // Official ordinals are a fallback only if no title supplies an episode.
+      if (hasEpisodes) break;
+    }
+    throw const XmlyException('episode_not_found', '专辑中没有找到该集', definitive: true);
   }
   Future<List<Track>> album(String albumId, {int pageSize = xmlyAlbumPageSize}) async {
     if (!RegExp(r'^[1-9][0-9]{0,18}$').hasMatch(albumId)) throw const XmlyException('invalid_id', '专辑 ID 必须是正整数', definitive: true);
     if (pageSize < 1 || pageSize > xmlyAlbumPageSize) throw const XmlyException('invalid_page', '专辑每页数量无效', definitive: true);
-    AlbumPage? cached;
-    if (client.accountAvailable) {
-      try { cached = await client.cachedAlbum(albumId); }
-      on XmlyException catch (error) {
-        if (error.code != 'invalid_cached_catalogue') rethrow;
-      }
-    }
-    if (cached != null) {
-      try {
-        if (cached.album.id != albumId || cached.page != 1 || cached.pageSize < 1 || cached.pageSize > 100000 ||
-            cached.total < 1 || cached.total > 5000 || cached.tracks.isEmpty ||
-            cached.tracks.length > cached.pageSize || cached.tracks.length > cached.total) {
-          throw const XmlyException('invalid_cached_catalogue', '历史目录不完整');
-        }
-        _checkTracks(cached.tracks, albumId, 0);
-      } on XmlyException { cached = null; }
-    }
-    final livePages = <int, AlbumPage>{};
     int? expectedTotal;
     Future<AlbumPage> livePage(int page) async {
-      final existing = livePages[page];
-      if (existing != null) return existing;
       final result = await client.album(albumId, page: page, pageSize: pageSize, ascending: true);
       if (result.total > 5000) throw const XmlyException('catalogue_limit', '专辑超过 5000 首队列上限', definitive: true);
       if (result.total < 0 || result.page != page || result.pageSize != pageSize || result.album.id != albumId) {
@@ -90,34 +81,17 @@ class XmlyCatalogue {
         throw const XmlyException('incomplete_catalogue', '专辑分页不完整，请刷新重试');
       }
       _checkTracks(result.tracks, albumId, offset);
-      livePages[page] = result;
       return result;
     }
-    final prefix = cached;
-    final maxPages = (5000 + pageSize - 1) ~/ pageSize;
-    final firstPage = prefix == null ? 1 : ((prefix.total + pageSize - 1) ~/ pageSize).clamp(1, maxPages).toInt();
-    final first = await livePage(firstPage);
+    // A matching historical tail cannot prove that earlier chapters or titles
+    // are current. Full search and range selection need every live page.
+    final first = await livePage(1);
     final total = first.total;
     if (total == 0) return const <Track>[];
     final lastPage = (total + pageSize - 1) ~/ pageSize;
-    var firstFreshPage = lastPage;
-    // A capped cache is only a prefix. Shrinkage invalidates even that prefix;
-    // otherwise prove the whole cached-tail overlap at its original positions.
-    var usePrefix = prefix != null && total >= prefix.total;
-    for (var page = lastPage; page >= 1; page--) {
-      final fresh = await livePage(page);
-      firstFreshPage = page;
-      final offset = (page - 1) * pageSize;
-      if (usePrefix && prefix != null && offset < prefix.tracks.length) {
-        for (var index = 0; index < fresh.tracks.length && offset + index < prefix.tracks.length; index++) {
-          if (fresh.tracks[index].id != prefix.tracks[offset + index].id) { usePrefix = false; break; }
-        }
-        if (usePrefix) break;
-      }
-    }
     final values = <Track>[
-      if (usePrefix) ...prefix!.tracks.take((firstFreshPage - 1) * pageSize),
-      for (var page = firstFreshPage; page <= lastPage; page++) ...livePages[page]!.tracks,
+      ...first.tracks,
+      for (var page = 2; page <= lastPage; page++) ...(await livePage(page)).tracks,
     ];
     if (values.length != total) throw const XmlyException('incomplete_catalogue', '专辑分页不完整，请刷新重试');
     _checkTracks(values, albumId, 0);

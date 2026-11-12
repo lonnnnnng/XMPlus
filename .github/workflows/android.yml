@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   native-tools:
-    # long: 本 fork 仅发布 macOS，避免推送版本标签时连带发布其他平台。
+    # long: fork 的签名包在本机验证后发布，避免上游流水线同时生成其他架构和 Windows 包。
     if: github.repository == 'teikengstudio/XMPlus'
     uses: ./.github/workflows/native-media.yml
     with:
@@ -219,10 +219,14 @@ jobs:
           set -euo pipefail
           (cd release && sha256sum --check SHA256SUMS)
           python3 tool/release_notes.py "$RELEASE_TAG" --output release/RELEASE-NOTES.md
+          release_flags=()
+          if [[ "$RELEASE_TAG" == "v1.1.8" ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" release/*.apk release/*.zip release/SHA256SUMS --clobber
-            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file release/RELEASE-NOTES.md
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file release/RELEASE-NOTES.md "${release_flags[@]}"
           else
             gh release create "$RELEASE_TAG" release/*.apk release/*.zip release/SHA256SUMS \
-              --verify-tag --title "$RELEASE_TAG" --notes-file release/RELEASE-NOTES.md
+              --verify-tag --title "$RELEASE_TAG" --notes-file release/RELEASE-NOTES.md "${release_flags[@]}"
           fi

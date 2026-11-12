@@ -33,6 +33,7 @@ class DownloadTask {
     this.actualQuality,
     this.processingFailed = false,
     this.outputMissing = false,
+    this.outputDeleted = false,
     this.receivedBytes = 0,
     this.totalBytes,
     this.bytesPerSecond = 0,
@@ -53,7 +54,7 @@ class DownloadTask {
   final int costSeconds, receivedBytes, retryCount;
   final int? expectedBalance, totalBytes;
   final bool userConfirmed, needsConfirmation, processingFailed;
-  final bool outputMissing;
+  final bool outputMissing, outputDeleted;
   final String? error, warning, actualQuality, receiptOperationId, finalPath;
   final double bytesPerSecond;
   final DateTime? retryAt;
@@ -91,6 +92,7 @@ class DownloadTask {
     Object? actualQuality = _keep,
     bool? processingFailed,
     bool? outputMissing,
+    bool? outputDeleted,
   }) => DownloadTask(
     id: id,
     accountIdentity: accountIdentity ?? this.accountIdentity,
@@ -112,6 +114,7 @@ class DownloadTask {
         : actualQuality as String?,
     processingFailed: processingFailed ?? this.processingFailed,
     outputMissing: outputMissing ?? this.outputMissing,
+    outputDeleted: outputDeleted ?? this.outputDeleted,
     receivedBytes: receivedBytes ?? this.receivedBytes,
     totalBytes: identical(totalBytes, _keep)
         ? this.totalBytes
@@ -147,6 +150,7 @@ class DownloadTask {
     'actualQuality': actualQuality,
     'processingFailed': processingFailed,
     'outputMissing': outputMissing,
+    'outputDeleted': outputDeleted,
     'bytesPerSecond': bytesPerSecond,
     'retryCount': retryCount,
     'receiptOperationId': receiptOperationId,
@@ -198,6 +202,7 @@ class DownloadTask {
       actualQuality: value['actualQuality'] as String?,
       processingFailed: value['processingFailed'] as bool? ?? false,
       outputMissing: value['outputMissing'] as bool? ?? false,
+      outputDeleted: value['outputDeleted'] as bool? ?? false,
       totalBytes: value['totalBytes'] == null ? null : integer('totalBytes'),
       bytesPerSecond: rate.toDouble(),
       retryCount: integer('retryCount'),

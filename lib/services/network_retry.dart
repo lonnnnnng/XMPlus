@@ -37,19 +37,34 @@ bool retryableTransport(Object error) {
       error is HttpException;
 }
 
+/// Parse the provider's cooldown without a policy-specific upper bound. Values
+/// beyond DateTime's range saturate only at the latest representable deadline.
+Duration? serverRetryAfter(String? value) {
+  final text = value?.trim();
+  if (text == null || text.isEmpty) return null;
+  final now = DateTime.now().toUtc();
+  if (RegExp(r'^[0-9]+$').hasMatch(text)) {
+    final seconds = BigInt.parse(text);
+    final maximum = DateTime.fromMillisecondsSinceEpoch(
+      8640000000000000,
+      isUtc: true,
+    ).difference(now);
+    final micros = seconds * BigInt.from(Duration.microsecondsPerSecond);
+    return micros > BigInt.from(maximum.inMicroseconds)
+        ? maximum
+        : Duration(microseconds: micros.toInt());
+  }
+  try {
+    final delay = HttpDate.parse(text).difference(now);
+    return delay.isNegative ? Duration.zero : delay;
+  } on HttpException {
+    return null;
+  }
+}
+
 Duration retryDelay(int attempt, String? retryAfter) {
   final backoff = Duration(seconds: 1 << attempt);
-  final seconds = int.tryParse(retryAfter?.trim() ?? '');
-  var server = Duration.zero;
-  if (seconds != null && seconds >= 0) {
-    server = Duration(seconds: seconds);
-  } else if (retryAfter != null) {
-    try {
-      server = HttpDate.parse(retryAfter).difference(DateTime.now().toUtc());
-    } on FormatException {
-      // An invalid header cannot shorten the normal cooldown.
-    }
-  }
+  final server = serverRetryAfter(retryAfter) ?? Duration.zero;
   return server > backoff ? server : backoff;
 }
 
@@ -59,11 +74,11 @@ Future<void> waitToRetry(
   Future<void>? closed,
   Future<void> Function()? checkpoint,
 }) async {
-  final deadline = DateTime.now().add(delay);
+  final watch = Stopwatch()..start();
   final closing = closed?.then<bool>((_) => true);
   while (true) {
     await checkpoint?.call();
-    final left = deadline.difference(DateTime.now());
+    final left = delay - watch.elapsed;
     if (left <= Duration.zero) return;
     final ready = Completer<void>();
     final timer = Timer(

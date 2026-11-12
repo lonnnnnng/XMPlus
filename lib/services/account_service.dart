@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
@@ -6,6 +7,7 @@ import 'package:synchronized/synchronized.dart';
 import 'package:uuid/uuid.dart';
 
 import '../api/xmly_client.dart';
+import '../models/download_task.dart';
 import '../models/xmly_models.dart';
 import '../storage/app_storage.dart';
 import '../storage/credential_store.dart';
@@ -41,6 +43,7 @@ class AccountService {
   final Lock _accounts = Lock();
   final Map<String, XmlyClient> _clients = {};
   final Map<String, XmlyClient> _settlementClients = {};
+  final Set<String> _missingCredentials = {};
   bool _loaded = false;
   bool _closed = false;
   bool _admissionPaused = false;
@@ -54,10 +57,15 @@ class AccountService {
   String? get primaryAccountId => storage.state['primaryAccountId'] as String?;
   XmlyClient? get activeClient => _clients[storage.state['activeAccountId']];
   List<String> get accountIds => List.unmodifiable(_clients.keys);
+  List<String> get missingCredentialAccountIds =>
+      List.unmodifiable(_missingCredentials);
 
   XmlyClient clientFor(String identity) {
     _ensureLoaded();
     final client = _settlementClients[identity] ?? _clients[identity];
+    if (client == null && _missingCredentials.contains(identity)) {
+      throw const AccountException('credential_missing', '安全凭据缺失，请重新导入原账号');
+    }
     if (client == null) throw const AccountException('missing', '请先登录此账号');
     return client;
   }
@@ -80,6 +88,8 @@ class AccountService {
     if (_closed) throw const AccountException('closed', '账号服务已关闭');
     if (_loaded) return;
     final restored = <String, XmlyClient>{};
+    final referenced = <String>{};
+    final missing = <String>{};
     try {
       final accounts = storage.state['accounts'] as Map;
       for (final entry in accounts.entries) {
@@ -92,6 +102,7 @@ class AccountService {
         if (ref is! String || !_validRef(ref, entry.key as String)) {
           throw const AccountException('corrupt', '账号凭据引用无效，请恢复备份');
         }
+        referenced.add(entry.key as String);
         final String? secret;
         try {
           secret = await secrets.read(ref);
@@ -102,7 +113,8 @@ class AccountService {
           );
         }
         if (secret == null) {
-          throw const AccountException('credential_missing', '安全凭据缺失，请重新导入原账号');
+          missing.add(entry.key as String);
+          continue;
         }
         final Credentials credentials;
         try {
@@ -119,10 +131,10 @@ class AccountService {
           urlCacheDirectory: _urlCacheDirectory,
         );
       }
-      if ((restored.isNotEmpty &&
-              (!restored.containsKey(primaryAccountId) ||
-                  !restored.containsKey(storage.state['activeAccountId']))) ||
-          (restored.isEmpty &&
+      if ((referenced.isNotEmpty &&
+              (!referenced.contains(primaryAccountId) ||
+                  !referenced.contains(storage.state['activeAccountId']))) ||
+          (referenced.isEmpty &&
               (primaryAccountId != null ||
                   storage.state['activeAccountId'] != null))) {
         throw const AccountException('corrupt', '主账号资料无效，请恢复备份');
@@ -134,6 +146,7 @@ class AccountService {
         );
       }
       _clients.addAll(restored);
+      _missingCredentials.addAll(missing);
       _loaded = true;
       await _cleanupSecrets();
       for (final client in restored.values) {
@@ -147,6 +160,7 @@ class AccountService {
         await client.flushUrlCache();
       }
       _clients.clear();
+      _missingCredentials.clear();
       _loaded = false;
       rethrow;
     }
@@ -155,8 +169,26 @@ class AccountService {
   Future<void> commit(
     Credentials credentials, {
     bool makePrimary = true,
+    String? recoveryIdentity,
   }) => _accounts.synchronized(() async {
     _ensureLoaded();
+    final identity = credentials.identity;
+    if (recoveryIdentity != null &&
+        (identity != recoveryIdentity ||
+            (!_missingCredentials.contains(recoveryIdentity) &&
+                !_clients.containsKey(recoveryIdentity)))) {
+      throw const AccountException(
+        'credential_mismatch',
+        '请导入原账号的 Cookie，并保留原设备 ID',
+      );
+    }
+    // A same-identity renewal that keeps both selections is not an account
+    // switch. Explicit recovery also permits renewing a backup account.
+    final recovering =
+        recoveryIdentity != null ||
+        (_clients.containsKey(identity) &&
+            storage.state['activeAccountId'] == identity &&
+            (!makePrimary || primaryAccountId == identity));
     // A candidate is never mounted during validation.
     final candidate = XmlyClient(credentials: credentials);
     var committed = false;
@@ -166,13 +198,25 @@ class AccountService {
       if (quota.remainingSeconds < 0) {
         throw const AccountException('quota_invalid', '无法核验账号可用听时');
       }
-      if (_clients.containsKey(credentials.identity)) {
+      if ((storage.state['accounts'] as Map).containsKey(identity)) {
         // New admissions remain locked; only existing same-identity usage
         // can use the verified token revision while the old token expires.
-        _settlementClients[credentials.identity] = candidate;
+        _settlementClients[identity] = candidate;
       }
-      await _prepareChange();
-      final identity = credentials.identity;
+      if (recovering && quiesceForRestore != null) {
+        // Repair only this identity's credential. Unknown operations remain
+        // blocked and reachable for reconciliation after authentication.
+        _admissionPaused = true;
+        await quiesceForRestore!();
+      } else {
+        if (recovering && _containsUnknown(storage.state['accounts'])) {
+          throw const AccountException(
+            'integration_required',
+            '请先连接账号恢复的任务暂停及听时保存服务',
+          );
+        }
+        await _prepareChange();
+      }
       final previous = (storage.state['accounts'] as Map)[identity] as Map?;
       final oldRef = previous?['credentialRef'] as String?;
       newRef = '$_prefix$identity.${const Uuid().v4()}';
@@ -196,7 +240,7 @@ class AccountService {
       }
       await storage.transaction((state) {
         final accounts = state['accounts'] as Map<String, dynamic>;
-        _assertSettled(accounts);
+        if (!recovering) _assertSettled(accounts);
         // Same uid/device identity retains every existing ledger/receipt.
         final record = Map<String, dynamic>.from(
           accounts[identity] as Map? ?? {},
@@ -212,9 +256,9 @@ class AccountService {
         });
         record.putIfAbsent('ledger', () => <String, dynamic>{});
         accounts[identity] = record;
-        state['activeAccountId'] = identity;
-        if (makePrimary || state['primaryAccountId'] == null) {
+        if (!recovering && (makePrimary || state['primaryAccountId'] == null)) {
           state['primaryAccountId'] = identity;
+          state['activeAccountId'] = identity;
         }
         (state['credentialCleanup'] as List).remove(newRef);
         if (oldRef != null) _scheduleCleanup(state, oldRef);
@@ -222,7 +266,7 @@ class AccountService {
       committed = true;
       await _replaceClient(candidate);
     } finally {
-      _settlementClients.remove(credentials.identity);
+      _settlementClients.remove(identity);
       if (!committed) candidate.close();
       // No old key is ever deleted before a successful reference commit.
       if (newRef != null) await _cleanupSecrets();
@@ -235,10 +279,10 @@ class AccountService {
   Future<void> restoreArchive({
     Map<String, dynamic>? settings,
     Map<String, dynamic>? library,
-    Map<String, dynamic>? history,
     List<Map<String, dynamic>>? importedAccounts,
     String? primaryAccountId,
     List<dynamic>? downloads,
+    List<dynamic>? downloadAlbums,
     Map<String, dynamic>? queue,
     required bool sameOrigin,
   }) => _accounts.synchronized(() async {
@@ -286,6 +330,11 @@ class AccountService {
         await quiesce!();
         await settle!();
       }
+      final restoredDownloads = downloads == null
+          ? null
+          : sameOrigin
+          ? await _retainLocalDownloads(downloads)
+          : downloads;
       // Unlike switching/removing an account, restore preserves every existing
       // unknown operation, and never resumes work or clears its billing block.
       if (refs.isNotEmpty) {
@@ -315,10 +364,9 @@ class AccountService {
       await storage.transaction((state) {
         if (settings != null) state['settings'] = settings;
         if (library != null) state['library'] = library;
-        if (history != null) state['history'] = history;
-        if (downloads != null) {
-          state['downloads'] = downloads;
-          state['downloadAlbums'] = <dynamic>[];
+        if (restoredDownloads != null) {
+          state['downloads'] = restoredDownloads;
+          state['downloadAlbums'] = downloadAlbums ?? <dynamic>[];
         }
         if (queue != null) state['queue'] = queue;
         final records = state['accounts'] as Map<String, dynamic>;
@@ -393,6 +441,47 @@ class AccountService {
       _admissionPaused = false;
     }
   });
+
+  Future<List<dynamic>> _retainLocalDownloads(List<dynamic> imported) async {
+    final local = <String, DownloadTask>{};
+    for (final raw in storage.state['downloads'] as List) {
+      final task = DownloadTask.fromJson(Map<String, dynamic>.from(raw as Map));
+      if (task.state == DownloadState.completed && task.finalPath != null) {
+        local[task.id] = task;
+      }
+    }
+    final restored = <dynamic>[];
+    for (final raw in imported) {
+      final incoming = DownloadTask.fromJson(
+        Map<String, dynamic>.from(raw as Map),
+      );
+      final existing = local[incoming.id];
+      var keep = false;
+      if (existing != null &&
+          existing.accountIdentity == incoming.accountIdentity &&
+          existing.track.id == incoming.track.id &&
+          p.equals(
+            p.normalize(existing.rootDirectory),
+            p.normalize(incoming.rootDirectory),
+          ) &&
+          p.isWithin(existing.rootDirectory, existing.finalPath!)) {
+        try {
+          keep =
+              await FileSystemEntity.type(
+                    existing.finalPath!,
+                    followLinks: false,
+                  ) ==
+                  FileSystemEntityType.file &&
+              await File(existing.finalPath!).length() > 0;
+        } on FileSystemException {
+          // Missing/inaccessible outputs use the normal paused restore path.
+        }
+      }
+      // Reuse only a current local association, never a path supplied by a ZIP.
+      restored.add(keep ? existing!.toJson() : raw);
+    }
+    return restored;
+  }
 
   static void _historicReceipts(Object? node) {
     if (node is Map) {
@@ -510,6 +599,7 @@ class AccountService {
     }
     candidate.attachUrlCache(_urlCacheDirectory);
     _clients[candidate.identity] = candidate;
+    _missingCredentials.remove(candidate.identity);
   }
 
   Future<void> _prepareChange() async {
@@ -626,25 +716,27 @@ class AccountService {
 
   /// Does not own AppStorage; caller closes storage after all services finish.
   /// A failed settlement leaves this service available for manual resolution.
-  Future<void> close() => _accounts.synchronized(() async {
-    if (_closed) return;
-    if (_loaded && _clients.isNotEmpty) {
-      try {
-        await _prepareChange();
-      } catch (_) {
-        _admissionPaused = false;
-        rethrow;
-      }
-    }
-    await _cleanupSecrets();
-    for (final client in _clients.values) {
-      client.close();
-    }
-    for (final client in _clients.values) {
-      await client.flushUrlCache();
-    }
-    _clients.clear();
-    _closed = true;
-    _admissionPaused = true;
-  });
+  /// Startup rollback preserves state because no work has been admitted yet.
+  Future<void> close({bool preserveState = false}) =>
+      _accounts.synchronized(() async {
+        if (_closed) return;
+        if (!preserveState && _loaded && _clients.isNotEmpty) {
+          try {
+            await _prepareChange();
+          } catch (_) {
+            _admissionPaused = false;
+            rethrow;
+          }
+        }
+        if (!preserveState) await _cleanupSecrets();
+        for (final client in _clients.values) {
+          client.close();
+        }
+        for (final client in _clients.values) {
+          await client.flushUrlCache();
+        }
+        _clients.clear();
+        _closed = true;
+        _admissionPaused = true;
+      });
 }

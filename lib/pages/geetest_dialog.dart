@@ -41,13 +41,6 @@ class GeetestDialog extends StatefulWidget {
 class _GeetestDialogState extends State<GeetestDialog> {
   static const _installer =
       'https://developer.microsoft.com/microsoft-edge/webview2/';
-  static const _fields = [
-    'captcha_id',
-    'lot_number',
-    'pass_token',
-    'gen_time',
-    'captcha_output',
-  ];
   final _nonce = _newNonce();
   late final String _documentUrl = Platform.isAndroid
       ? 'https://appassets.androidplatform.net/xmplus-captcha/$_nonce/index.html'
@@ -86,6 +79,7 @@ class _GeetestDialogState extends State<GeetestDialog> {
       PlatformInAppWebViewController.debugLoggingSettings.enabled = false;
       if (Platform.isWindows) {
         final version = await WebViewEnvironment.getAvailableVersion();
+        if (!mounted || _finished) return;
         if (version == null || version.isEmpty) {
           _runtimeMissing = true;
           _fail('未检测到 WebView2 运行时。可安装微软官方运行时后重试，或返回 Cookie 登录。');
@@ -96,6 +90,10 @@ class _GeetestDialogState extends State<GeetestDialog> {
             .create(recursive: true);
         final profile = await base.createTemp('session-');
         _profile = profile;
+        if (!mounted || _finished) {
+          await _deleteProfile(profile);
+          return;
+        }
         _stage = 'WebView2 环境创建';
         final environment = await WebViewEnvironment.create(
           settings: WebViewEnvironmentSettings(
@@ -104,7 +102,7 @@ class _GeetestDialogState extends State<GeetestDialog> {
             language: 'zh-CN',
           ),
         );
-        if (!mounted) {
+        if (!mounted || _finished) {
           await environment.dispose();
           await _deleteProfile(profile);
           return;
@@ -114,7 +112,7 @@ class _GeetestDialogState extends State<GeetestDialog> {
         _fail('此平台暂不能显示安全验证，请返回导入登录信息。');
         return;
       }
-      if (!mounted) return;
+      if (!mounted || _finished) return;
       setState(() => _ready = true);
       _timeout = Timer(
         const Duration(seconds: 45),
@@ -122,6 +120,10 @@ class _GeetestDialogState extends State<GeetestDialog> {
       );
     } catch (error) {
       _failStage(error);
+      final profile = _profile;
+      if (profile != null && (!mounted || _finished)) {
+        await _deleteProfile(profile);
+      }
     }
   }
 
@@ -152,9 +154,7 @@ class _GeetestDialogState extends State<GeetestDialog> {
 
   @override
   void dispose() {
-    _accepting = false;
-    _finished = true;
-    _timeout?.cancel();
+    _invalidate();
     final environment = _environment, profile = _profile;
     unawaited(() async {
       try {
@@ -177,21 +177,44 @@ class _GeetestDialogState extends State<GeetestDialog> {
         'gsensebot.com',
       ].any((host) => uri.host == host || uri.host.endsWith('.$host'));
 
+  Map<String, dynamic>? _parseGeetestResult(Object? raw) {
+    const fields = [
+      'captcha_id',
+      'lot_number',
+      'pass_token',
+      'gen_time',
+      'captcha_output',
+    ];
+    if (raw is! Map ||
+        raw.length != fields.length ||
+        fields.any(
+          (key) =>
+              raw[key] is! String ||
+              !RegExp(r'^[\x21-\x7e]{1,8192}$').hasMatch(raw[key] as String),
+        ) ||
+        raw['captcha_id'] != widget.captchaId) {
+      return null;
+    }
+    return {for (final key in fields) key: raw[key]};
+  }
+
   String _html() {
-    final id = jsonEncode(widget.captchaId), nonce = jsonEncode(_nonce);
+    final id = jsonEncode(widget.captchaId);
     return '''<!doctype html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' https://*.geetest.com https://*.geevisit.com https://*.gsensebot.com; connect-src https://*.geetest.com https://*.geevisit.com https://*.gsensebot.com; img-src data: blob: https://*.geetest.com https://*.geevisit.com https://*.gsensebot.com; style-src 'unsafe-inline' https://*.geetest.com; font-src data: https://*.geetest.com; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' https://*.geetest.com https://*.geevisit.com https://*.gsensebot.com; connect-src https://*.geetest.com https://*.geevisit.com https://*.gsensebot.com; img-src data: blob: https://*.geetest.com https://*.geevisit.com https://*.gsensebot.com; style-src 'unsafe-inline' https://*.geetest.com; font-src data: https://*.geetest.com; frame-src https://*.geetest.com https://*.geevisit.com https://*.gsensebot.com; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>XMPlus 安全验证</title>
 <style>body{font:16px sans-serif;text-align:center;padding:20px}button{font:inherit;padding:12px}</style>
 </head><body><p id="status">正在加载安全验证…</p><button id="verify" hidden>开始验证</button>
 <script>
 (() => {
-  const nonce=$nonce;
+  const nonce=${jsonEncode(_nonce)};
   const emit=(kind,value)=>{if(window===window.top) window.flutter_inappwebview.callHandler('xmlyCaptcha',nonce,kind,value);};
   const fail=()=>{document.getElementById('status').textContent='安全验证加载失败，请关闭后重试';emit('error',null);};
   const start=()=>{
     if(typeof initGeetest4!=='function'){fail();return;}
-    initGeetest4({captchaId:$id,product:'bind',language:'zho',https:true,onError:fail,offlineCb:fail},captcha=>{
+    initGeetest4({captchaId:$id,product:'bind',language:'zho',protocol:'https://',onError:fail,offlineCb:fail},captcha=>{
       captcha.onReady(()=>{
         document.getElementById('status').textContent='请完成安全验证';
         const button=document.getElementById('verify');button.hidden=false;
@@ -200,8 +223,8 @@ class _GeetestDialogState extends State<GeetestDialog> {
       }).onSuccess(()=>{
         const v=captcha.getValidate();
         if(!v){fail();return;}
-        const out={};
-        ['captcha_id','lot_number','pass_token','gen_time','captcha_output'].forEach(k=>out[k]=v[k]);
+        const out={captcha_id:$id};
+        ['lot_number','pass_token','gen_time','captcha_output'].forEach(k=>out[k]=v[k]);
         emit('success',out);
       }).onError(fail).onClose(()=>emit('close',null));
     });
@@ -240,23 +263,14 @@ class _GeetestDialogState extends State<GeetestDialog> {
               _timeout?.cancel();
               break;
             case 'success':
-              final raw = args[2];
-              if (raw is! Map ||
-                  raw.length != _fields.length ||
-                  _fields.any(
-                    (key) =>
-                        raw[key] is! String ||
-                        !RegExp(r'^[\x21-\x7e]{1,8192}$')
-                            .hasMatch(raw[key] as String),
-                  ) ||
-                  raw['captcha_id'] != widget.captchaId) {
+              final result = _parseGeetestResult(args[2]);
+              if (result == null) {
                 _fail('安全验证结果无效，请关闭后重新验证。');
                 return null;
               }
               _finished = true;
               _accepting = false;
-              Navigator.of(context)
-                  .pop({for (final key in _fields) key: raw[key]});
+              Navigator.of(context).pop(result);
               break;
             case 'error':
               _fail('安全验证未完成，请关闭后重试，或使用登录信息导入。');
@@ -348,6 +362,9 @@ class _GeetestDialogState extends State<GeetestDialog> {
                 ),
                 onWebViewCreated: _created,
                 shouldOverrideUrlLoading: (_, action) async {
+                  if (!action.isForMainFrame) {
+                    return NavigationActionPolicy.ALLOW;
+                  }
                   final url = action.request.url?.toString();
                   return url == 'about:blank' ||
                           (Platform.isAndroid &&
@@ -376,7 +393,9 @@ class _GeetestDialogState extends State<GeetestDialog> {
                       data: Uint8List.fromList(utf8.encode(_html())),
                     );
                   }
-                  if (request.isForMainFrame != true &&
+                  // Windows reports every resource as a main-frame request;
+                  // top-level navigation is guarded separately above.
+                  if ((Platform.isWindows || request.isForMainFrame != true) &&
                       _allowedResource(request.url.uriValue))
                     return null;
                   return WebResourceResponse(

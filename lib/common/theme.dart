@@ -20,6 +20,7 @@ class AppAppearance extends ChangeNotifier {
   Color _seedColor = const Color(defaultSeedColor);
   double _textScale = 1;
   bool _oledBlack = false;
+  final _pending = <String, Object>{};
   String? error;
 
   void reload() {
@@ -51,6 +52,10 @@ class AppAppearance extends ChangeNotifier {
   }
 
   Future<void> _save(Map<String, dynamic> changes) async {
+    final request = Object();
+    for (final key in changes.keys) {
+      _pending[key] = request;
+    }
     try {
       await storage.transaction((state) {
         final settings = state['settings'] as Map;
@@ -63,6 +68,10 @@ class AppAppearance extends ChangeNotifier {
       error = null;
     } catch (_) {
       error = '设置保存失败，原设置已保留';
+    } finally {
+      for (final key in changes.keys) {
+        if (identical(_pending[key], request)) _pending.remove(key);
+      }
     }
     notifyListeners();
   }
@@ -73,12 +82,12 @@ class AppAppearance extends ChangeNotifier {
   bool get oledBlack => _oledBlack;
 
   set themeMode(ThemeMode value) {
-    if (_themeMode == value) return;
+    if (!_pending.containsKey('themeMode') && _themeMode == value) return;
     unawaited(_save({'themeMode': value.name}));
   }
 
   set seedColor(Color value) {
-    if (_seedColor == value) return;
+    if (!_pending.containsKey('seedColor') && _seedColor == value) return;
     unawaited(_save({'seedColor': value.toARGB32()}));
   }
 
@@ -90,12 +99,12 @@ class AppAppearance extends ChangeNotifier {
         'Expected a finite value from 0.8 to 1.5',
       );
     }
-    if (_textScale == value) return;
+    if (!_pending.containsKey('textScale') && _textScale == value) return;
     unawaited(_save({'textScale': value}));
   }
 
   set oledBlack(bool value) {
-    if (_oledBlack == value) return;
+    if (!_pending.containsKey('oledBlack') && _oledBlack == value) return;
     unawaited(_save({'oledBlack': value}));
   }
 }
@@ -195,10 +204,6 @@ ThemeData getThemeData({
     ),
     navigationRailTheme: NavigationRailThemeData(
       backgroundColor: colorScheme.surface,
-    ),
-    bottomNavigationBarTheme: BottomNavigationBarThemeData(
-      backgroundColor: colorScheme.surface,
-      elevation: 0,
     ),
     snackBarTheme: SnackBarThemeData(
       elevation: 0,

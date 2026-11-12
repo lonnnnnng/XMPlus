@@ -10,12 +10,19 @@ import 'package:win32/win32.dart' as win;
 
 import '../models/xmly_models.dart';
 import 'android_platform.dart';
+import 'file_paths.dart';
 
 /// Filesystem policy shared by downloads and the media processor. No audio or
 /// account operation belongs here; callers validate media before [commit].
 class DownloadPaths {
   static const _mib = 1024 * 1024;
   static const _maxPath = 259; // Excludes the terminating Windows NUL.
+  static const mediaTemporaryPrefix = '.xmplus-media-';
+  static const mediaManifestSuffix = '.xmplus-media.json';
+  static const _mediaProbeName = 'output.abcdefghij';
+  static const _temporarySuffixReserve = '0000000000000000';
+  static int get _maxTargetPath =>
+      Platform.isWindows ? _maxPath - mediaManifestSuffix.length : _maxPath;
   static const _defaultPattern = '{index} - {title} [{trackId}]';
   static final _illegal = RegExp(r'[<>:"/\\|?*\x00-\x1f\x7f]');
   static final _reserved = RegExp(
@@ -28,7 +35,18 @@ class DownloadPaths {
     int reserveBytes = 0,
     int minimumFreeMiB = 512,
   }) async {
-    _absoluteRoot(root);
+    final base = _absoluteRoot(root);
+    if (Platform.isWindows &&
+        p
+                .join(
+                  base,
+                  '$mediaTemporaryPrefix$_temporarySuffixReserve',
+                  _mediaProbeName,
+                )
+                .length >
+            _maxPath) {
+      throw const XmlyException('path_too_long', '下载目录过长，请选择较短的根目录');
+    }
     final minimumMiB = math.max(512, minimumFreeMiB);
     if (reserveBytes < 0 ||
         minimumFreeMiB < 0 ||
@@ -36,14 +54,24 @@ class DownloadPaths {
         reserveBytes > 0x7fffffffffffffff - minimumMiB * _mib) {
       throw const XmlyException('invalid_space', '可用空间设置无效');
     }
-    if (!await Directory(root).exists()) {
+    if (!await Directory(base).exists()) {
       throw const XmlyException('download_directory', '下载目录不存在，请重新选择');
     }
     // A real write, flush and deletion tests this account's access, not mode bits.
     Directory? probeDirectory;
     try {
-      probeDirectory = await Directory(root).createTemp('.xmplus-write-');
-      final probe = File(p.join(probeDirectory.path, 'probe'));
+      probeDirectory = await Directory(base).createTemp(
+        Platform.isWindows ? mediaTemporaryPrefix : '.xmplus-write-',
+      );
+      final probe = File(
+        p.join(
+          probeDirectory.path,
+          Platform.isWindows ? _mediaProbeName : 'probe',
+        ),
+      );
+      if (Platform.isWindows && probe.path.length > _maxPath) {
+        throw const XmlyException('path_too_long', '下载目录过长，请选择较短的根目录');
+      }
       final handle = await probe.open(mode: FileMode.writeOnly);
       try {
         await handle.writeByte(0);
@@ -64,7 +92,7 @@ class DownloadPaths {
       }
     }
     final available = await _availableBytes(
-      await Directory(root).resolveSymbolicLinks(),
+      await Directory(base).resolveSymbolicLinks(),
     );
     if (available < 0) {
       throw const XmlyException('disk_space_unavailable', '无法查询下载目录的可用空间');
@@ -184,23 +212,24 @@ class DownloadPaths {
       '${safeComponent(rendered, id: track.number, maxLength: fileLimit)}.${extension.toLowerCase()}',
     ]);
     var result = makePath();
-    if (result.length > _maxPath && albumFolders) {
+    if (result.length > _maxTargetPath && albumFolders) {
       final minimum = folderId.length + 4;
       folderLimit = math.max(
         minimum,
-        p.basename(p.dirname(result)).length - (result.length - _maxPath),
+        p.basename(p.dirname(result)).length - (result.length - _maxTargetPath),
       );
       result = makePath();
     }
-    if (result.length > _maxPath) {
+    if (result.length > _maxTargetPath) {
       final minimum = track.number.length + 4;
       fileLimit = math.max(
         minimum,
-        p.basenameWithoutExtension(result).length - (result.length - _maxPath),
+        p.basenameWithoutExtension(result).length -
+            (result.length - _maxTargetPath),
       );
       result = makePath();
     }
-    if (result.length > _maxPath || !p.isWithin(base, result)) {
+    if (result.length > _maxTargetPath || !p.isWithin(base, result)) {
       throw const XmlyException('path_too_long', '下载目录过长，请选择较短的根目录');
     }
     return result;
@@ -227,7 +256,7 @@ class DownloadPaths {
       final suffix = ' ($number)$extension';
       final limit = math.min(
         240 - utf8.encode(suffix).length,
-        _maxPath - directory.length - 1 - suffix.length,
+        _maxTargetPath - directory.length - 1 - suffix.length,
       );
       var name = stem;
       if (name.length > limit ||
@@ -257,8 +286,8 @@ class DownloadPaths {
     String destination, {
     bool overwrite = false,
   }) async {
-    final source = p.normalize(p.absolute(temporary));
-    final target = p.normalize(p.absolute(destination));
+    final source = absoluteFilePath(temporary);
+    final target = absoluteFilePath(destination);
     final sourceCanonical = await File(source).resolveSymbolicLinks();
     final targetParent = await Directory(p.dirname(target))
         .resolveSymbolicLinks();
@@ -299,7 +328,7 @@ class DownloadPaths {
     if (root.isEmpty || root.contains('\x00') || !p.isAbsolute(root)) {
       throw const XmlyException('download_directory', '请选择绝对路径的下载目录');
     }
-    return p.normalize(root);
+    return absoluteFilePath(root);
   }
 
   static String _shorten(String text, int units, int bytes) {

@@ -10,15 +10,19 @@ import 'package:path/path.dart' as p;
 import 'package:synchronized/synchronized.dart';
 
 import '../models/xmly_models.dart';
+import '../services/network_retry.dart';
 import '../services/request_diagnostics.dart';
 import 'xmly_crypto.dart';
 
 class XmlyClient {
+  static final Map<String, _BalanceChanges> _balanceChanges = {};
+  static final _readPolicyKey = Object();
   static const mobile = 'https://mobile.ximalaya.com';
   static const cachedAlbumOrigin = 'https://mobwsa.ximalaya.com';
   static const searchOrigin = 'https://www.ximalaya.com';
   static const collector = 'https://xdcs-collector.ximalaya.com';
   static const welfare = 'https://m.ximalaya.com';
+  static const paidOrigin = 'https://mpaywsa.ximalaya.com';
   static const _maxResponse = 2 * 1024 * 1024;
   static const _maxCachedAlbumResponse = 16 * 1024 * 1024;
   static const _qualities = ['m4a_128', 'm4a_64', 'mp3_64', 'mp3_32', 'm4a_24'];
@@ -61,6 +65,20 @@ class XmlyClient {
   }
   String get identity => credentials?.identity ?? 'anonymous';
   String get cacheIdentity => credentials?.cacheIdentity ?? 'anonymous';
+
+  /// Serializes balance mutations for one account/device, including clients
+  /// using refreshed credentials. Callers acquire account/ledger locks first.
+  Future<T> withBalanceChange<T>(Future<T> Function() action) async {
+    final key = _requireAccount().identity;
+    final changes = _balanceChanges.putIfAbsent(key, _BalanceChanges.new);
+    changes.users++;
+    try {
+      return await changes.lock.synchronized(action);
+    } finally {
+      if (--changes.users == 0) _balanceChanges.remove(key);
+    }
+  }
+
   bool get accountAvailable => credentials != null && !_expired;
   Map<String, String> context() {
     final value = _requireAccount();
@@ -98,8 +116,18 @@ class XmlyClient {
   static bool _endpoint(String method, String origin, String path) {
     if (origin == cachedAlbumOrigin)
       return _cachedAlbumEndpoint(method, origin, path);
+    if (origin == paidOrigin)
+      return method == 'GET' &&
+          RegExp(r'^/mobile/track/pay/[1-9][0-9]{0,18}/ts-[0-9]+$')
+              .hasMatch(path);
     if (origin == searchOrigin)
-      return method == 'GET' && path == '/revision/search';
+      return method == 'GET' &&
+          const {
+            '/revision/search',
+            '/revision/track/simple',
+            '/revision/comment/queryComments',
+            '/revision/comment/queryReplies',
+          }.contains(path);
     if (origin == collector)
       return method == 'POST' && path == '/nyx/v1/history/merge/android';
     if (origin == welfare)
@@ -116,11 +144,16 @@ class XmlyClient {
         '/fmobile-track/fmobile/track/v2/baseInfo',
         '/lite-mobile/audi/func/v1/config',
         '/lite-mobile/audi/func/v1/report',
+        '/lite-mobile/like/v1/like',
+        '/lite-mobile/like/v1/dislike',
+        '/subscribe/album/subscribe/delete',
+        '/subscribe/album-subscribe/and/ask-anchor-info',
       ].contains(path);
     return method == 'GET' &&
         (const [
               '/mobile/v1/album/track/v2',
               '/nyx/v1/history/query/android',
+              '/lite-mobile/like/v1/user-likes',
             ].contains(path) ||
             RegExp(r'^/mobile/track/[1-9][0-9]{0,18}$').hasMatch(path) ||
             RegExp(r'^/fmobile-album/album/track/ts-[0-9]+$').hasMatch(path) ||
@@ -132,25 +165,16 @@ class XmlyClient {
                 .hasMatch(path));
   }
 
-  static Duration _retryAfter(String? value) {
-    var seconds = double.tryParse(value ?? '');
-    if (seconds == null) {
-      try {
-        seconds =
-            HttpDate.parse(value!)
-                .difference(DateTime.now().toUtc())
-                .inMilliseconds /
-            1000;
-      } catch (_) {
-        seconds = 30;
-      }
-    }
-    if (!seconds.isFinite) seconds = 30;
-    return Duration(milliseconds: (seconds.clamp(1, 86400) * 1000).ceil());
-  }
+  static Duration _retryAfter(String? value) =>
+      serverRetryAfter(value) ?? const Duration(seconds: 30);
 
   Never _rateLimit(String origin, Duration delay) {
-    _cooldowns[origin] = DateTime.now().add(delay);
+    _cooldowns[origin] = DateTime.fromMillisecondsSinceEpoch(
+      min(
+        DateTime.now().millisecondsSinceEpoch + delay.inMilliseconds,
+        8640000000000000,
+      ),
+    );
     throw XmlyException(
       'rate_limited',
       '请求过于频繁，请在 ${delay.inSeconds + (delay.inMilliseconds % 1000 == 0 ? 0 : 1)} 秒后重试',
@@ -166,14 +190,91 @@ class XmlyClient {
     unawaited(clearUrlCache());
   }
 
-  Future<void> _retryWait(Duration delay) async {
-    final ready = Completer<void>();
-    final timer = Timer(delay, ready.complete);
-    try {
-      await Future.any<void>([ready.future, _closeSignal.future]);
-    } finally {
-      timer.cancel();
+  /// Retry/cancellation belongs to this operation, not the shared account client.
+  /// Only semantically read-only requests inherit it; writes are never replayed.
+  Future<T> withReadPolicy<T>(
+    Future<T> Function() action, {
+    required int rateLimitRetries,
+    Duration minimumRateLimitDelay = Duration.zero,
+    Future<void>? cancelled,
+    Future<void> Function()? checkpoint,
+  }) {
+    if (rateLimitRetries < 0 ||
+        rateLimitRetries > 1000 ||
+        minimumRateLimitDelay.isNegative) {
+      throw const XmlyException('invalid_retry', '限流重试设置无效');
     }
+    return runZoned(
+      action,
+      zoneValues: {
+        _readPolicyKey: _ReadPolicy(
+          rateLimitRetries,
+          minimumRateLimitDelay,
+          cancelled,
+          checkpoint,
+        ),
+      },
+    );
+  }
+
+  Future<void> _checkRead(_ReadPolicy? policy) async {
+    await policy?.checkpoint?.call();
+    if (_closed) {
+      throw const XmlyException('client_closed', '连接已关闭', definitive: true);
+    }
+    if (policy?.stopped == true) {
+      throw const XmlyException('request_cancelled', '请求已停止', definitive: true);
+    }
+  }
+
+  Future<T> _readAttempt<T>(
+    Future<T> action,
+    CancelToken cancel,
+    _ReadPolicy? policy,
+  ) async {
+    try {
+      final result = await Future.any<T>([
+        action,
+        _closeSignal.future.then<T>((_) {
+          cancel.cancel();
+          throw const XmlyException('client_closed', '连接已关闭', definitive: true);
+        }),
+        if (policy?.cancelled != null)
+          policy!.cancelled!.then<T>((_) async {
+            cancel.cancel();
+            await _checkRead(policy);
+            throw const XmlyException(
+              'request_cancelled',
+              '请求已停止',
+              definitive: true,
+            );
+          }),
+      ]);
+      await _checkRead(policy);
+      return result;
+    } finally {
+      cancel.cancel();
+    }
+  }
+
+  Future<void> _retryWait(Duration delay, [_ReadPolicy? policy]) async {
+    await _checkRead(policy);
+    try {
+      await waitToRetry(
+        delay,
+        closed: Future.any<void>([
+          _closeSignal.future,
+          if (policy?.cancelled != null) policy!.cancelled!,
+        ]),
+        checkpoint: () => _checkRead(policy),
+      );
+    } catch (_) {
+      // Preserve the caller's typed stop exception rather than leaking the
+      // shared wait helper's generic close error into a paused download.
+      await _checkRead(policy);
+      rethrow;
+    }
+    await _checkRead(policy);
   }
 
   Future<Map<String, dynamic>> request(
@@ -214,22 +315,27 @@ class XmlyClient {
             const [
               '/fmobile-track/fmobile/track/v2/baseInfo',
               '/lite-mobile/audi/func/v1/config',
-            ].contains(path)) ||
-        (origin == collector &&
-            method == 'POST' &&
-            path == '/nyx/v1/history/merge/android');
-    final rewardClaim =
-        method == 'POST' &&
-        origin == welfare &&
-        RegExp(r'^/lite-earn/ting/welfare/rewardDuration/ts-[0-9]+$')
-            .hasMatch(path);
-    for (var attempt = 0; attempt < 5; attempt++) {
+            ].contains(path));
+    final policy = readOnly
+        ? Zone.current[_readPolicyKey] as _ReadPolicy?
+        : null;
+    var failures = 0, rateRetries = 0;
+    while (true) {
+      await _checkRead(policy);
+      Duration? rateDelay;
       final until = _cooldowns[origin];
       if (until != null && until.isAfter(DateTime.now())) {
-        await _retryWait(until.difference(DateTime.now()));
+        final delay = until.difference(DateTime.now());
+        if (policy?.rateLimitRetries == 0) {
+          throw XmlyException(
+            'rate_limited',
+            '请求过于频繁，请稍后重试',
+            retryAfter: delay,
+          );
+        }
+        await _retryWait(delay, policy);
       }
-      if (_closed)
-        throw const XmlyException('client_closed', '连接已关闭', definitive: true);
+      await _checkRead(policy);
       final cancel = CancelToken();
       final diagnostic = RequestDiagnostic(
         account: identity,
@@ -237,7 +343,7 @@ class XmlyClient {
         url: '$origin$path',
       );
       try {
-        return await _attempt(
+        final action = _attempt(
           method,
           origin,
           path,
@@ -248,7 +354,11 @@ class XmlyClient {
           form,
           cancel,
           diagnostic,
-        ).timeout(
+        );
+        final attempt = readOnly
+            ? _readAttempt(action, cancel, policy)
+            : action;
+        return await attempt.timeout(
           const Duration(seconds: 25),
           onTimeout: () {
             cancel.cancel();
@@ -259,52 +369,54 @@ class XmlyClient {
           },
         );
       } on _RetryableStatus {
-        if (!readOnly || attempt == 4)
+        if (!readOnly || failures++ >= 4)
           throw XmlyException(
             readOnly ? 'network' : 'uncertain',
             readOnly ? '喜马拉雅服务暂时不可用' : '请求结果未知，请核对后重试',
           );
       } on DioException catch (error) {
+        await _checkRead(policy);
         if (error.error case final XmlyException limit
             when limit.code == 'response_too_large')
           throw limit;
         if (cancel.cancelError?.error case final XmlyException limit
             when limit.code == 'response_too_large')
           throw limit;
-        if (!readOnly || attempt == 4)
+        if (!readOnly || failures++ >= 4)
           throw XmlyException(
             readOnly ? 'network' : 'uncertain',
             readOnly ? '请求失败或超时' : '请求结果未知，请核对后重试',
           );
       } on TimeoutException {
-        if (!readOnly || attempt == 4)
+        if (!readOnly || failures++ >= 4)
           throw XmlyException(
             readOnly ? 'network' : 'uncertain',
             readOnly ? '请求失败或超时' : '请求结果未知，请核对后重试',
           );
       } on IOException {
-        if (!readOnly || attempt == 4)
+        if (!readOnly || failures++ >= 4)
           throw XmlyException(
             readOnly ? 'network' : 'uncertain',
             readOnly ? '请求失败或超时' : '请求结果未知，请核对后重试',
           );
       } on XmlyException catch (error) {
-        final safeRewardRejection =
-            rewardClaim &&
-            error.code == 'rejected' &&
-            diagnostic.status == 200 &&
-            error.definitive;
-        if ((error.code != 'rate_limited' && !safeRewardRejection) ||
-            attempt == 4)
+        if (!readOnly || error.code != 'rate_limited') rethrow;
+        if (policy != null) {
+          if (rateRetries++ >= policy.rateLimitRetries) rethrow;
+          final server = error.retryAfter ?? Duration.zero;
+          rateDelay = server > policy.minimumRateLimitDelay
+              ? server
+              : policy.minimumRateLimitDelay;
+        } else if (failures++ >= 4) {
           rethrow;
+        }
       }
-      final backoff = Duration(seconds: 1 << attempt);
+      final backoff = Duration(seconds: 1 << max(0, min(failures - 1, 4)));
       final cooldown = _cooldowns[origin]?.difference(DateTime.now());
-      await _retryWait(
-        cooldown != null && cooldown > backoff ? cooldown : backoff,
-      );
+      var delay = cooldown != null && cooldown > backoff ? cooldown : backoff;
+      if (rateDelay != null && rateDelay > delay) delay = rateDelay;
+      await _retryWait(delay, policy);
     }
-    throw const XmlyException('network', '请求失败');
   }
 
   Future<Map<String, dynamic>> _attempt(
@@ -363,7 +475,7 @@ class XmlyClient {
         ? Transformer.urlEncodeMap(data, ListFormat.multi)
         : jsonEncode(data);
     final bytes = BytesBuilder(copy: false);
-    diagnostic.responseByteCount = () => bytes.length;
+    diagnostic.responseBytes = bytes.toBytes;
     try {
       final response = await _dio.fetch<ResponseBody>(options);
       final body = response.data;
@@ -425,7 +537,7 @@ class XmlyClient {
       }
       if (body == null) throw const XmlyException('invalid_json', '接口响应为空');
       final responseBytes = bytes.takeBytes();
-      diagnostic.responseByteCount = () => responseBytes.length;
+      diagnostic.responseBytes = () => responseBytes;
       Map<String, dynamic> payload;
       try {
         final decoded = jsonDecode(
@@ -610,34 +722,43 @@ class XmlyClient {
       'device': 'android',
       'isQueryInvitationBrand': 'true',
     };
-    Map<String, dynamic> response;
+    Map<String, dynamic>? authenticated;
     if (accountAvailable) {
       try {
-        response = await request(
+        authenticated = await request(
           'GET',
           mobile,
           '/fmobile-album/album/track/ts-${DateTime.now().millisecondsSinceEpoch}',
           query: query,
         );
       } on XmlyException catch (error) {
-        if (error.code != 'login_expired') rethrow;
-        response = await request(
-          'GET',
-          mobile,
-          '/mobile/v1/album/track/v2',
-          query: query,
-          account: false,
-        );
+        // Preserve the public fallback on expiry; only transport failures may
+        // otherwise discard a source. Permissions, throttling and bad data fail.
+        if (error.code != 'login_expired' && error.code != 'network') rethrow;
       }
-    } else {
-      response = await request(
+    }
+    Map<String, dynamic>? public;
+    try {
+      public = await request(
         'GET',
         mobile,
         '/mobile/v1/album/track/v2',
         query: query,
         account: false,
       );
+    } on XmlyException catch (error) {
+      if (error.code != 'network' || authenticated == null) rethrow;
     }
+    final response = authenticated != null && public != null
+        ? _mergeAlbumPages(
+            authenticated,
+            public,
+            number,
+            page,
+            pageSize,
+            ascending,
+          )
+        : authenticated ?? public!;
     return _readAlbumPage(
       response,
       number,
@@ -647,14 +768,161 @@ class XmlyClient {
     );
   }
 
-  Future<AlbumPage> _readAlbumPage(
+  static int? _albumOrder(Map<String, dynamic> raw) {
+    int? order;
+    for (final key in ['orderNo', 'orderNum', 'order_no']) {
+      final value = xmlyPositive(raw[key]);
+      if (value == null) continue;
+      if (order != null && order != value)
+        throw const XmlyException('invalid_catalogue', '专辑声音序号冲突');
+      order = value;
+    }
+    return order;
+  }
+
+  static Map<String, dynamic> _albumMetadata(
+    Map<String, dynamic> preferred,
+    Map<String, dynamic> other,
+  ) {
+    bool present(Object? value) => value != null && value != '';
+    final result = <String, dynamic>{
+      ...other,
+      for (final entry in preferred.entries)
+        if (present(entry.value)) entry.key: entry.value,
+    };
+    // Normalize aliases so a public alias cannot shadow authenticated metadata.
+    for (final keys in [
+      ['album_id', 'albumId'],
+      ['album_title', 'albumTitle'],
+      ['is_paid', 'isPaid'],
+      [
+        'coverLarge',
+        'coverMiddle',
+        'coverSmall',
+        'cover_path',
+        'album_cover_path',
+        'cover_url',
+        'albumImage',
+      ],
+    ]) {
+      for (final source in [preferred, other]) {
+        final values = keys.map((key) => source[key]).where(present);
+        if (values.isEmpty) continue;
+        for (final key in keys) result[key] = values.first;
+        break;
+      }
+    }
+    final order = _albumOrder(preferred) ?? _albumOrder(other);
+    if (order != null) {
+      for (final key in ['orderNo', 'orderNum', 'order_no'])
+        result[key] = order;
+    }
+    for (final source in [preferred, other]) {
+      final names = [
+        source['nickname'],
+        xmlyMap(source['userInfo'])['nickname'],
+      ].where(present);
+      if (names.isEmpty) continue;
+      result['nickname'] = names.first;
+      break;
+    }
+    if (preferred['duration'] is! num || (preferred['duration'] as num) <= 0) {
+      if (other['duration'] is num && (other['duration'] as num) > 0)
+        result['duration'] = other['duration'];
+    }
+    return result;
+  }
+
+  Map<String, dynamic> _mergeAlbumPages(
+    Map<String, dynamic> authenticated,
+    Map<String, dynamic> public,
+    String number,
+    int page,
+    int pageSize,
+    bool ascending,
+  ) {
+    final sources = [
+      _albumPageData(authenticated, number, page, pageSize, ascending),
+      _albumPageData(public, number, page, pageSize, ascending),
+    ];
+    final total = _total(sources.first['totalCount'] ?? 0);
+    if (_total(sources.last['totalCount'] ?? 0) != total)
+      throw const XmlyException('catalogue_changed', '专辑总数不一致，请刷新重试');
+    final items = <String, Map<String, dynamic>>{};
+    final orders = <int, String>{};
+    final successors = <String, Set<String>>{};
+    final incoming = <String, int>{};
+    void before(String left, String right) {
+      if (successors[left]!.add(right)) incoming[right] = incoming[right]! + 1;
+    }
+
+    // Both relative orders constrain the result. Unlike officialPosition, real
+    // server ordinals may also order disjoint runs between two common anchors.
+    for (final source in sources) {
+      String? previous;
+      for (final raw in source['list'] as List) {
+        final item = xmlyMap(raw);
+        final id = xmlyIdentifier('${item['trackId'] ?? item['id']}');
+        final existing = items[id];
+        final order = _albumOrder(item);
+        if (existing != null &&
+            order != null &&
+            _albumOrder(existing) != null &&
+            _albumOrder(existing) != order)
+          throw const XmlyException('invalid_catalogue', '专辑声音序号冲突');
+        items[id] = existing == null ? item : _albumMetadata(existing, item);
+        successors.putIfAbsent(id, () => <String>{});
+        incoming.putIfAbsent(id, () => 0);
+        if (order != null) {
+          if (orders.containsKey(order) && orders[order] != id)
+            throw const XmlyException('invalid_catalogue', '专辑声音序号重复');
+          orders[order] = id;
+        }
+        if (previous != null) before(previous, id);
+        previous = id;
+      }
+    }
+    final ordinals = orders.keys.toList()..sort();
+    if (!ascending) {
+      for (var index = ordinals.length - 1; index > 0; index--)
+        before(orders[ordinals[index]]!, orders[ordinals[index - 1]]!);
+    } else {
+      for (var index = 1; index < ordinals.length; index++)
+        before(orders[ordinals[index - 1]]!, orders[ordinals[index]]!);
+    }
+    final ready = incoming.keys.where((id) => incoming[id] == 0).toSet();
+    final merged = <Map<String, dynamic>>[];
+    while (ready.isNotEmpty) {
+      if (ready.length != 1)
+        throw const XmlyException('invalid_catalogue', '专辑声音顺序不明确');
+      final id = ready.single;
+      ready.remove(id);
+      merged.add(items[id]!);
+      for (final next in successors[id]!) {
+        incoming[next] = incoming[next]! - 1;
+        if (incoming[next] == 0) ready.add(next);
+      }
+    }
+    if (merged.length != items.length)
+      throw const XmlyException('invalid_catalogue', '专辑声音顺序冲突');
+    return {
+      ...authenticated,
+      'album': _albumMetadata(
+        xmlyMap(authenticated['album']),
+        xmlyMap(public['album']),
+      ),
+      'data': {...sources.first, 'list': merged},
+    };
+  }
+
+  Map<String, dynamic> _albumPageData(
     Map<String, dynamic> response,
-    String number, {
-    required int page,
-    required int pageSize,
-    required bool ascending,
+    String number,
+    int page,
+    int pageSize,
+    bool ascending, {
     bool cached = false,
-  }) async {
+  }) {
     if (response['data'] is! Map)
       throw const XmlyException('invalid_catalogue', '专辑列表无效');
     final data = xmlyMap(response['data']);
@@ -669,9 +937,8 @@ class XmlyClient {
           total > 5000 ||
           (total > 0
               ? maxPage != (total + pageSize - 1) ~/ pageSize
-              : maxPage > 1)) {
+              : maxPage > 1))
         throw const XmlyException('invalid_catalogue', '历史目录分页无效');
-      }
     } else if ((data.containsKey('pageId') && _total(data['pageId']) != page) ||
         (data.containsKey('pageSize') &&
             _total(data['pageSize']) != pageSize)) {
@@ -679,17 +946,67 @@ class XmlyClient {
     }
     if (data['list'] is! List ||
         (data['list'] as List).length > pageSize ||
-        (cached &&
-            ((data['list'] as List).length > total ||
-                (total > 0 && (data['list'] as List).isEmpty)))) {
+        (data['list'] as List).length >
+            (total - (page - 1) * pageSize).clamp(0, pageSize) ||
+        (cached && total > 0 && (data['list'] as List).isEmpty))
       throw const XmlyException('invalid_catalogue', '专辑列表无效');
+    for (final source in [xmlyMap(response['album']), data]) {
+      for (final key in ['albumId', if (!identical(source, data)) 'id']) {
+        if (source[key] != null && xmlyIdentifier('${source[key]}') != number)
+          throw const XmlyException('id_mismatch', '专辑信息不匹配');
+      }
+    }
+    final identifiers = <String>{};
+    final orders = <int>{};
+    int? previousOrder;
+    for (final raw in data['list'] as List) {
+      if (raw is! Map)
+        throw const XmlyException('invalid_catalogue', '专辑声音信息无效');
+      if (cached && raw['albumId'] == null && raw['album_id'] == null)
+        throw const XmlyException('invalid_catalogue', '历史目录缺少专辑信息');
+      for (final key in ['albumId', 'album_id']) {
+        if (raw[key] != null && xmlyIdentifier('${raw[key]}') != number)
+          throw const XmlyException('id_mismatch', '专辑包含其他专辑的声音');
+      }
+      final id = xmlyIdentifier('${raw['trackId'] ?? raw['id'] ?? ''}');
+      if (!identifiers.add(id))
+        throw const XmlyException('duplicate_page', '专辑声音重复，请刷新重试');
+      final order = _albumOrder(xmlyMap(raw));
+      if (order != null) {
+        if (!orders.add(order) ||
+            (previousOrder != null &&
+                (ascending ? order <= previousOrder : order >= previousOrder)))
+          throw const XmlyException('invalid_catalogue', '专辑声音序号冲突');
+        previousOrder = order;
+      }
+    }
+    return data;
+  }
+
+  Future<AlbumPage> _readAlbumPage(
+    Map<String, dynamic> response,
+    String number, {
+    required int page,
+    required int pageSize,
+    required bool ascending,
+    bool cached = false,
+  }) async {
+    final data = _albumPageData(
+      response,
+      number,
+      page,
+      pageSize,
+      ascending,
+      cached: cached,
+    );
+    final total = _total(cached ? data['totalCount'] : data['totalCount'] ?? 0);
+    if (cached) {
+      pageSize = _total(data['pageSize']);
+    } else if ((data['list'] as List).length !=
+        (total - (page - 1) * pageSize).clamp(0, pageSize)) {
+      throw const XmlyException('incomplete_catalogue', '专辑分页不完整，请刷新重试');
     }
     final albumData = xmlyMap(response['album']);
-    for (final key in ['albumId', 'id']) {
-      if (albumData[key] != null &&
-          xmlyIdentifier('${albumData[key]}') != number)
-        throw const XmlyException('id_mismatch', '专辑信息不匹配');
-    }
     var album = Album.fromApi({
       ...?_albums[number]?.raw,
       ...albumData,
@@ -733,26 +1050,15 @@ class XmlyClient {
       );
     }
     final tracks = <Track>[];
-    final identifiers = <String>{};
     for (final raw in data['list'] as List) {
-      if (raw is! Map)
-        throw const XmlyException('invalid_catalogue', '专辑声音信息无效');
-      if (cached && raw['albumId'] == null && raw['album_id'] == null)
-        throw const XmlyException('invalid_catalogue', '历史目录缺少专辑信息');
-      for (final key in ['albumId', 'album_id']) {
-        if (raw[key] != null && xmlyIdentifier('${raw[key]}') != number)
-          throw const XmlyException('id_mismatch', '专辑包含其他专辑的声音');
-      }
       final position = (page - 1) * pageSize + tracks.length + 1;
       final value = Track.fromApi(
-        xmlyMap(raw),
+        {...xmlyMap(raw), if (total > 0) 'totalCount': total},
         album: album,
         position: ascending
             ? position
             : (total > 0 ? total - position + 1 : null),
       );
-      if (!identifiers.add(value.id))
-        throw const XmlyException('duplicate_page', '专辑声音重复，请刷新重试');
       tracks.add(value);
     }
     _albums[number] = album;
@@ -898,15 +1204,109 @@ class XmlyClient {
       );
   }
 
-  Future<Track> track(String trackId) async {
+  Track _withCatalogueMetadata(Track value) {
+    final previous = _metadata[value.number];
+    final sameAlbum =
+        value.albumId.isNotEmpty && previous?.albumId == value.albumId;
+    final total =
+        xmlyPositive(value.raw['totalCount']) ??
+        (sameAlbum ? xmlyPositive(previous!.raw['totalCount']) : null);
+    final position =
+        value.officialPosition ??
+        (sameAlbum ? previous!.officialPosition : null);
+    return Track.fromJson({
+      ...value.toJson(),
+      'raw': {
+        ...value.raw,
+        if (total != null) 'totalCount': total,
+        if (position != null) 'officialPosition': position,
+      },
+    });
+  }
+
+  /// Official sound manuscript only, never the track's promotional introduction.
+  /// Public web reads must not carry this client's mobile account credentials.
+  Future<String?> fetchManuscript(String trackId) async {
+    final number = xmlyIdentifier(trackId);
+    final response = await request(
+      'GET',
+      searchOrigin,
+      '/revision/track/simple',
+      account: false,
+      query: {'trackId': number},
+    );
+    final data = response['data'];
+    final info = data is Map ? data['trackInfo'] : null;
+    if (info is! Map) {
+      throw const XmlyException('protocol', '文稿响应格式无效');
+    }
+    final track = xmlyMap(info);
+    if (track.containsKey('trackId') || track.containsKey('id')) {
+      _matchingId(track, number);
+    }
+    final lyric = track['lyric'], draft = track['draft'];
+    if ((lyric != null && lyric is! String) ||
+        (draft != null && draft is! String)) {
+      throw const XmlyException('protocol', '文稿内容格式无效');
+    }
+    if (lyric is String && lyric.trim().isNotEmpty) return lyric;
+    return draft is String && draft.trim().isNotEmpty ? draft : null;
+  }
+
+  Future<Track> track(String trackId, {bool force = false}) async {
     final number = xmlyIdentifier(trackId);
     final cached = _metadata[number];
-    if (cached != null) return cached;
+    if (!force && cached != null) return cached;
     final info = await _info(number);
     _matchingId(info, number);
-    final value = Track.fromApi(info);
+    final value = _withCatalogueMetadata(Track.fromApi(info));
     _remember(value);
     return value;
+  }
+
+  /// Validate a full paid authorization before it can enter the normal media
+  /// probe/cache path. Sample metadata may coexist with an authorized full file.
+  static ({Uri uri, String quality}) paidAudio(
+    Map<String, dynamic> metadata, {
+    required String trackId,
+    required String albumId,
+    required String uid,
+  }) {
+    if (metadata['ret'] != 0)
+      throw const XmlyException(
+        'permission_denied',
+        '未获得付费声音的完整权限',
+        definitive: true,
+      );
+    _matchingId(metadata, xmlyIdentifier(trackId));
+    if ('${metadata['albumId'] ?? ''}' != xmlyIdentifier(albumId))
+      throw const XmlyException(
+        'id_mismatch',
+        '返回的专辑 ID 不匹配',
+        definitive: true,
+      );
+    if (metadata['isAuthorized'] != true)
+      throw const XmlyException(
+        'permission_denied',
+        '未获得付费声音的完整权限',
+        definitive: true,
+      );
+    if (metadata['isPreview'] == true || metadata['isTrial'] == true)
+      throw const XmlyException(
+        'preview_only',
+        '仅获得试听音频，不能下载完整声音',
+        definitive: true,
+      );
+    final uri = mediaUri(XmlyCrypto.paidMediaUrl(metadata, uid: uid));
+    if (uri.path.toLowerCase().contains('_preview_'))
+      throw const XmlyException(
+        'preview_only',
+        '仅获得试听音频，不能下载完整声音',
+        definitive: true,
+      );
+    // Official parseChargeJsonAndGetUrl selects the default 64-kbit resource,
+    // not the requested quality or highestQualityLevel (which is only a ceiling).
+    return (uri: uri, quality: uri.path.endsWith('.m4a') ? 'm4a_64' : 'mp3_64');
   }
 
   static final _mediaRedirectPath = RegExp(
@@ -1178,7 +1578,82 @@ class XmlyClient {
     bool force = false,
     bool preferCached = false,
     String? quality,
+    int mediaAuthRetries = 3,
+    bool Function()? isActive,
   }) => _resolveLock.synchronized(() async {
+    if (mediaAuthRetries < 0 || mediaAuthRetries > 3)
+      throw const XmlyException('invalid_retry', '音频授权重试次数无效');
+    for (var attempt = 0; ; attempt++) {
+      if (isActive != null && !isActive())
+        throw const XmlyException('cache_source_changed', '音频来源已变化');
+      try {
+        return await _resolveOnce(
+          trackId,
+          force: force || attempt > 0,
+          preferCached: preferCached && attempt == 0,
+          quality: quality,
+        );
+      } on XmlyException catch (error) {
+        if (error.code != 'media_unauthorized' || attempt >= mediaAuthRetries)
+          rethrow;
+      }
+    }
+  });
+
+  /// Only for a task with a matching, confirmed, non-historical debit receipt.
+  /// Reuses an already verified lease; never obtains a new authorization.
+  Future<ResolvedAudio?> cachedPrepaidAudio(
+    String trackId, {
+    String? quality,
+  }) => _resolveLock.synchronized(() async {
+    final requestedQuality = quality ?? this.quality;
+    if (requestedQuality != 'auto' && !_qualities.contains(requestedQuality)) {
+      throw const XmlyException('invalid_quality', '音质设置无效', definitive: true);
+    }
+    final number = xmlyIdentifier(trackId);
+    final epoch = _urlEpoch;
+    await _urlCacheReady;
+    if (_closed || !accountAvailable || epoch != _urlEpoch) return null;
+    for (final candidateQuality
+        in requestedQuality == 'auto' ? _qualities : [requestedQuality]) {
+      final key = _urlKey(number, candidateQuality);
+      final entry = _urls[key];
+      if (entry == null ||
+          !entry.verified ||
+          entry.authorizedTrack == null ||
+          entry.requiresReward != true ||
+          (entry.deadline != null &&
+              !entry.deadline!.isAfter(DateTime.now()))) {
+        continue;
+      }
+      final track = entry.authorizedTrack!;
+      final ResolvedAudio audio;
+      try {
+        audio = await _resolvedAudio(entry, track, true);
+      } on XmlyException catch (error) {
+        if (error.code == 'media_unauthorized') return null;
+        rethrow;
+      }
+      if (_closed ||
+          !accountAvailable ||
+          epoch != _urlEpoch ||
+          !identical(_urls[key], entry) ||
+          (entry.deadline != null &&
+              !entry.deadline!.isAfter(DateTime.now()))) {
+        return null;
+      }
+      _remember(track);
+      return audio;
+    }
+    return null;
+  });
+
+  Future<ResolvedAudio> _resolveOnce(
+    String trackId, {
+    required bool force,
+    required bool preferCached,
+    String? quality,
+  }) async {
     if (_closed)
       throw const XmlyException('client_closed', '连接已关闭', definitive: true);
     final requestedQuality = quality ?? this.quality;
@@ -1186,7 +1661,14 @@ class XmlyClient {
       throw const XmlyException('invalid_quality', '音质设置无效', definitive: true);
     }
     final number = xmlyIdentifier(trackId);
-    if (force) invalidate(number);
+    if (force) {
+      _invalidateUrls(
+        number,
+        quality: requestedQuality == 'auto' ? null : requestedQuality,
+      );
+      await flushUrlCache();
+    }
+    await _checkRead(Zone.current[_readPolicyKey] as _ReadPolicy?);
     final epoch = _urlEpoch;
     await _urlCacheReady;
     if (_closed)
@@ -1258,6 +1740,7 @@ class XmlyClient {
         '仅获得试听音频，不能下载完整声音',
         definitive: true,
       );
+    final track = _withCatalogueMetadata(Track.fromApi(info));
     final candidates = <String, Uri>{};
     void add(String type, Object? value, {bool encrypted = false}) {
       if (value is! String || value.isEmpty || candidates.containsKey(type))
@@ -1297,6 +1780,23 @@ class XmlyClient {
         }
       }
     }
+    if (candidates.isEmpty &&
+        accountAvailable &&
+        (info['isPaid'] ?? info['is_paid']) != false) {
+      final metadata = await request(
+        'GET',
+        paidOrigin,
+        '/mobile/track/pay/$number/ts-${DateTime.now().millisecondsSinceEpoch}',
+        query: {'device': 'android'},
+      );
+      final paid = paidAudio(
+        metadata,
+        trackId: number,
+        albumId: track.albumId,
+        uid: _requireAccount().uid,
+      );
+      candidates[paid.quality] = paid.uri;
+    }
     if (candidates.isEmpty)
       throw const XmlyException(
         'permission_denied',
@@ -1308,14 +1808,11 @@ class XmlyClient {
         ? requestedQuality
         : _qualities.firstWhere(candidates.containsKey);
     final uri = candidates[chosen]!;
-    final now = DateTime.now();
     final key = _urlKey(number, chosen);
     final cached = _urls[key];
-    final entry =
-        cached != null &&
-            (cached.deadline == null || cached.deadline!.isAfter(now))
-        ? cached
-        : _CachedAudioUrl(number, chosen, uri, _urlDeadline(uri));
+    // We have just obtained fresh authority. Only the explicit preferCached
+    // branch may select an old lease; its URL cannot override this response.
+    final entry = _CachedAudioUrl(number, chosen, uri, _urlDeadline(uri));
     // An invalidation during authorization must not repopulate the session cache.
     if (!_closed &&
         !_expired &&
@@ -1327,9 +1824,8 @@ class XmlyClient {
         evictedVerified =
             _urls.remove(_urls.keys.first)!.verified || evictedVerified;
       }
-      if (evictedVerified) _saveUrlCache();
+      if (evictedVerified || cached?.verified == true) _saveUrlCache();
     }
-    final track = Track.fromApi(info);
     _remember(track);
     if (!_closed &&
         !_expired &&
@@ -1340,7 +1836,7 @@ class XmlyClient {
       if (entry.verified) _saveUrlCache();
     }
     return await _resolvedAudio(entry, track, reward != null);
-  });
+  }
 
   Future<ResolvedAudio> _resolvedAudio(
     _CachedAudioUrl entry,
@@ -1379,9 +1875,12 @@ class XmlyClient {
     final host = audio.uri.host.toLowerCase();
     if (!host.startsWith('audiopay') || !host.endsWith('.xmcdn.com'))
       return audio;
+    final policy = Zone.current[_readPolicyKey] as _ReadPolicy?;
+    await _checkRead(policy);
     var uri = audio.uri;
     final epoch = _urlEpoch;
-    for (var redirects = 0; ; redirects++) {
+    var redirects = 0, rateRetries = 0;
+    while (true) {
       final cancel = CancelToken();
       final diagnostic = RequestDiagnostic(
         account: identity,
@@ -1389,117 +1888,133 @@ class XmlyClient {
         url: uri.toString(),
       );
       try {
-        final next = await Future.any<Uri?>([
-          (() async {
-            uri = mediaUri(uri.toString());
-            final options = Options(
-              method: 'GET',
-              headers: const {
-                'User-Agent': 'XMPlus/1.0',
-                'Accept': 'audio/*, application/octet-stream',
-                'Accept-Encoding': 'identity',
-                'Range': 'bytes=0-11',
-              },
-              responseType: ResponseType.stream,
-              followRedirects: false,
-              maxRedirects: 0,
-              validateStatus: (_) => true,
-              receiveTimeout: const Duration(seconds: 10),
-              sendTimeout: const Duration(seconds: 10),
-            ).compose(_dio.options, uri.toString(), cancelToken: cancel);
-            // Never reuse API cookies, tickets, or caller-supplied media headers.
-            diagnostic.requestHeaders = options.headers;
-            final response = await _dio.fetch<ResponseBody>(options);
-            final status = response.statusCode ?? 0;
-            diagnostic.status = status;
-            diagnostic.responseHeaders = response.headers.map;
-            diagnostic.completeness = '仅探测音频前缀，未下载完整响应体';
-            if ([301, 302, 303, 307, 308].contains(status)) {
-              final location = response.headers.value('location');
-              if (location == null || location.isEmpty || redirects >= 5)
-                throw const XmlyException('invalid_media', '音频重定向过多或无效');
-              try {
-                return mediaUri(uri.resolve(location).toString());
-              } on FormatException {
-                throw const XmlyException('invalid_media', '音频重定向地址无效');
+        final next = await _readAttempt(
+          Future.any<Uri?>([
+            (() async {
+              uri = mediaUri(uri.toString());
+              final options = Options(
+                method: 'GET',
+                headers: const {
+                  'User-Agent': 'XMPlus/1.0',
+                  'Accept': 'audio/*, application/octet-stream',
+                  'Accept-Encoding': 'identity',
+                  'Range': 'bytes=0-11',
+                },
+                responseType: ResponseType.stream,
+                followRedirects: false,
+                maxRedirects: 0,
+                validateStatus: (_) => true,
+                receiveTimeout: const Duration(seconds: 10),
+                sendTimeout: const Duration(seconds: 10),
+              ).compose(_dio.options, uri.toString(), cancelToken: cancel);
+              // Never reuse API cookies, tickets, or caller-supplied media headers.
+              diagnostic.requestHeaders = options.headers;
+              final response = await _dio.fetch<ResponseBody>(options);
+              final status = response.statusCode ?? 0;
+              diagnostic.status = status;
+              diagnostic.responseHeaders = response.headers.map;
+              diagnostic.completeness = '仅探测音频前缀，未下载完整响应体';
+              if ([301, 302, 303, 307, 308].contains(status)) {
+                final location = response.headers.value('location');
+                if (location == null || location.isEmpty || redirects >= 5)
+                  throw const XmlyException('invalid_media', '音频重定向过多或无效');
+                try {
+                  return mediaUri(uri.resolve(location).toString());
+                } on FormatException {
+                  throw const XmlyException('invalid_media', '音频重定向地址无效');
+                }
               }
-            }
-            final bytes = BytesBuilder(copy: false);
-            diagnostic.responseByteCount = () => bytes.length;
-            final successful = status == 200 || status == 206;
-            final limit = successful ? 12 : 4096;
-            final body = response.data;
-            if (body != null) {
-              await for (final chunk in body.stream) {
-                final count = min(chunk.length, limit - bytes.length);
-                if (count > 0)
-                  bytes.add(Uint8List.sublistView(chunk, 0, count));
-                if (bytes.length == limit) break;
+              final bytes = BytesBuilder(copy: false);
+              diagnostic.responseBytes = bytes.toBytes;
+              final successful = status == 200 || status == 206;
+              final limit = successful ? 12 : 4096;
+              final body = response.data;
+              if (body != null) {
+                await for (final chunk in body.stream) {
+                  final count = min(chunk.length, limit - bytes.length);
+                  if (count > 0)
+                    bytes.add(Uint8List.sublistView(chunk, 0, count));
+                  if (bytes.length == limit) break;
+                }
               }
-            }
-            if (!successful)
-              throw XmlyException(
-                'media_http',
-                status == 401 || status == 403
-                    ? '音频授权已失效，请重新获取'
-                    : '音频请求返回 HTTP $status',
-              );
-            final type = (response.headers.value('content-type') ?? '')
-                .split(';')
-                .first
-                .trim()
-                .toLowerCase();
-            if (!(type.startsWith('audio/') ||
-                type.startsWith('video/') ||
-                type == 'application/octet-stream' ||
-                type == 'binary/octet-stream' ||
-                type == 'application/ogg' ||
-                type.isEmpty))
-              throw const XmlyException('invalid_media', '响应不是音频，未缓存错误页面');
-            final prefix = bytes.takeBytes();
-            diagnostic.responseByteCount = () => prefix.length;
-            bool text(int offset, String value) {
-              if (prefix.length < offset + value.length) return false;
-              for (var i = 0; i < value.length; i++) {
-                if (prefix[offset + i] != value.codeUnitAt(i)) return false;
+              if (status == 429) {
+                _rateLimit(
+                  uri.origin,
+                  _retryAfter(response.headers.value('retry-after')),
+                );
               }
-              return true;
-            }
+              if (!successful)
+                throw XmlyException(
+                  status == 401 || status == 403
+                      ? 'media_unauthorized'
+                      : 'media_http',
+                  status == 401 || status == 403
+                      ? '音频授权已失效，请重新获取'
+                      : '音频请求返回 HTTP $status',
+                );
+              final type = (response.headers.value('content-type') ?? '')
+                  .split(';')
+                  .first
+                  .trim()
+                  .toLowerCase();
+              if (!(type.startsWith('audio/') ||
+                  type.startsWith('video/') ||
+                  type == 'application/octet-stream' ||
+                  type == 'binary/octet-stream' ||
+                  type == 'application/ogg' ||
+                  type.isEmpty))
+                throw const XmlyException('invalid_media', '响应不是音频，未缓存错误页面');
+              final prefix = bytes.takeBytes();
+              diagnostic.responseBytes = () => prefix;
+              bool text(int offset, String value) {
+                if (prefix.length < offset + value.length) return false;
+                for (var i = 0; i < value.length; i++) {
+                  if (prefix[offset + i] != value.codeUnitAt(i)) return false;
+                }
+                return true;
+              }
 
-            if (!(text(0, 'ID3') ||
-                text(0, 'fLaC') ||
-                text(0, 'OggS') ||
-                (text(0, 'RIFF') && text(8, 'WAVE')) ||
-                text(4, 'ftyp') ||
-                (prefix.length >= 4 &&
-                    prefix[0] == 0xff &&
-                    (((prefix[1] & 0xe0) == 0xe0 &&
-                            (prefix[1] & 0x06) != 0 &&
-                            (prefix[2] & 0xf0) != 0xf0 &&
-                            (prefix[2] & 0xf0) != 0 &&
-                            (prefix[2] & 0x0c) != 0x0c) ||
-                        ((prefix[1] & 0xf6) == 0xf0 &&
-                            (prefix[2] & 0x3c) != 0x3c)))))
-              throw const XmlyException('invalid_media', '响应不是可识别的音频，未缓存错误页面');
-            if (status == 206 &&
-                !RegExp(r'^bytes 0-[0-9]+/(?:[0-9]+|\*)$')
-                    .hasMatch(response.headers.value('content-range') ?? ''))
-              throw const XmlyException('invalid_media', '音频范围响应无效');
-            return null;
-          })(),
-          _closeSignal.future.then<Uri?>((_) {
-            throw const XmlyException(
-              'client_closed',
-              '连接已关闭',
-              definitive: true,
-            );
-          }),
-        ]).timeout(const Duration(seconds: 25));
+              if (!(text(0, 'ID3') ||
+                  text(0, 'fLaC') ||
+                  text(0, 'OggS') ||
+                  (text(0, 'RIFF') && text(8, 'WAVE')) ||
+                  text(4, 'ftyp') ||
+                  (prefix.length >= 4 &&
+                      prefix[0] == 0xff &&
+                      (((prefix[1] & 0xe0) == 0xe0 &&
+                              (prefix[1] & 0x06) != 0 &&
+                              (prefix[2] & 0xf0) != 0xf0 &&
+                              (prefix[2] & 0xf0) != 0 &&
+                              (prefix[2] & 0x0c) != 0x0c) ||
+                          ((prefix[1] & 0xf6) == 0xf0 &&
+                              (prefix[2] & 0x3c) != 0x3c)))))
+                throw const XmlyException(
+                  'invalid_media',
+                  '响应不是可识别的音频，未缓存错误页面',
+                );
+              if (status == 206 &&
+                  !RegExp(r'^bytes 0-[0-9]+/(?:[0-9]+|\*)$')
+                      .hasMatch(response.headers.value('content-range') ?? ''))
+                throw const XmlyException('invalid_media', '音频范围响应无效');
+              return null;
+            })(),
+            _closeSignal.future.then<Uri?>((_) {
+              throw const XmlyException(
+                'client_closed',
+                '连接已关闭',
+                definitive: true,
+              );
+            }),
+          ]),
+          cancel,
+          policy,
+        ).timeout(const Duration(seconds: 25));
         if (_closed)
           throw const XmlyException('client_closed', '连接已关闭', definitive: true);
         if (_expired || epoch != _urlEpoch || !identical(_urls[key], entry))
           throw const XmlyException('cache_source_changed', '音频来源已变化，请重新获取');
         if (next != null) {
+          redirects++;
           uri = next;
           continue;
         }
@@ -1507,9 +2022,31 @@ class XmlyClient {
         return audio;
       } catch (error) {
         cancel.cancel();
+        if (error is XmlyException &&
+            error.code == 'media_unauthorized' &&
+            identical(_urls[key], entry)) {
+          // A rejected track authorization cannot fall back to a cached
+          // sibling quality. Revoke even if the caller stopped the probe.
+          _invalidateUrls(entry.number);
+        }
+        if (_closed || policy?.stopped == true) {
+          // A cancelled read must not wait for the diagnostic disk queue before
+          // releasing its caller. Preserve the failure record independently.
+          unawaited(diagnostic.fail(error));
+          await _checkRead(policy);
+        }
+        if (error is XmlyException && error.code == 'rate_limited') {
+          await diagnostic.fail(error);
+          if (rateRetries++ >= (policy?.rateLimitRetries ?? 4)) rethrow;
+          final server = error.retryAfter ?? Duration.zero;
+          final minimum = policy?.minimumRateLimitDelay ?? Duration.zero;
+          await _retryWait(server > minimum ? server : minimum, policy);
+          continue;
+        }
         _invalidateLease(key, entry);
         if (error is! XmlyException) diagnostic.transportError = '$error';
         await diagnostic.fail(error);
+        await _checkRead(policy);
         if (error is XmlyException) rethrow;
         throw const XmlyException('network', '音频地址请求失败或超时');
       } finally {
@@ -1527,17 +2064,21 @@ class XmlyClient {
     _saveUrlCache(revoke: true);
   }
 
-  void _invalidateUrls(String? number) {
+  void _invalidateUrls(String? number, {String? quality}) {
     _urlEpoch++;
     if (number == null) {
       _urls.clear();
       _discardUrlCacheLoad = true;
       _urlLoadInvalidations.clear();
     } else {
-      _urls.removeWhere((_, entry) => entry.number == number);
+      _urls.removeWhere(
+        (_, entry) =>
+            entry.number == number &&
+            (quality == null || entry.quality == quality),
+      );
       if (!_urlCacheLoaded) {
-        for (final quality in _qualities) {
-          _urlLoadInvalidations.add(_urlKey(number, quality));
+        for (final candidate in quality == null ? _qualities : [quality]) {
+          _urlLoadInvalidations.add(_urlKey(number, candidate));
         }
       }
     }
@@ -1562,6 +2103,29 @@ class XmlyClient {
     // Keep the last validated leases for queued writes; callers drain before
     // releasing AppStorage's lock. Old callbacks cannot write after close.
   }
+}
+
+class _ReadPolicy {
+  _ReadPolicy(
+    this.rateLimitRetries,
+    this.minimumRateLimitDelay,
+    Future<void>? cancelled,
+    this.checkpoint,
+  ) {
+    this.cancelled = cancelled?.then((_) {
+      stopped = true;
+    });
+  }
+  final int rateLimitRetries;
+  final Duration minimumRateLimitDelay;
+  late final Future<void>? cancelled;
+  final Future<void> Function()? checkpoint;
+  bool stopped = false;
+}
+
+class _BalanceChanges {
+  final lock = Lock();
+  int users = 0;
 }
 
 class _CachedAudioUrl {

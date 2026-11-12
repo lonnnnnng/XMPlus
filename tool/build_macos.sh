@@ -7,8 +7,9 @@ flutter pub get --enforce-lockfile
 bash tool/build_macos_media.sh
 flutter build macos --release --no-pub --target lib/main.dart
 APP="$ROOT/build/macos/Build/Products/Release/XMPlus.app"
-mkdir -p "$APP/Contents/Helpers" "$APP/Contents/Resources/licenses/media" "$ROOT/dist" "$ROOT/Temp"
-cp build/macos-media/universal/ffmpeg build/macos-media/universal/ffprobe "$APP/Contents/Helpers/"
+# long: 沿用上游相对可执行文件的工具路径，避免为 Mac 再维护媒体处理分支。
+mkdir -p "$APP/Contents/MacOS/tools/ffmpeg" "$APP/Contents/Resources/licenses/media" "$ROOT/dist" "$ROOT/Temp"
+cp build/macos-media/universal/ffmpeg build/macos-media/universal/ffprobe "$APP/Contents/MacOS/tools/ffmpeg/"
 cp LICENSE NOTICE "$APP/Contents/Resources/licenses/"
 cp licenses/media/licenses/* "$APP/Contents/Resources/licenses/media/"
 cp licenses/media/THIRD-PARTY-NOTICES.txt "$APP/Contents/Resources/licenses/media/"
@@ -32,7 +33,7 @@ for path in app.rglob('*'):
             for line in links.splitlines():
                 if line.startswith('\t') and not line.strip().startswith(('/usr/lib/', '/System/Library/', '@rpath/', '@loader_path/', '@executable_path/')):
                     raise SystemExit(f'Nonportable library dependency: {path}: {line.strip()}')
-for name in ('MacOS/XMPlus', 'Helpers/ffmpeg', 'Helpers/ffprobe', 'Frameworks/App.framework/App'):
+for name in ('MacOS/XMPlus', 'MacOS/tools/ffmpeg/ffmpeg', 'MacOS/tools/ffmpeg/ffprobe', 'Frameworks/App.framework/App'):
     subprocess.run(['lipo', str(app / 'Contents' / name), '-verify_arch', 'arm64', 'x86_64'], check=True)
 info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
 if info['CFBundleIdentifier'] != 'com.lonnnnnng.xmplus':
